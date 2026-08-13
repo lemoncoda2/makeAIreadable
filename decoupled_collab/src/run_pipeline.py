@@ -385,6 +385,33 @@ def main(argv: Optional[list[str]] = None) -> None:
     project_root = Path(config["_project_root"])
     os.chdir(project_root)
 
+    if not args.dry_run:
+        from utils.benchmarks import require_real_benchmarks
+        from utils.failfast import ConfigError
+
+        eval_cfg = config.get("eval", {})
+        overrides = {
+            "mbpp_train": project_root / "data" / "mbpp_train.jsonl",
+            "mbpp_plus": resolve_path(
+                project_root, eval_cfg.get("mbpp_plus", "./data/mbpp_plus_test.jsonl")
+            ),
+            "lcb_easy": resolve_path(
+                project_root, eval_cfg.get("lcb_easy", "./data/lcb_easy.jsonl")
+            ),
+        }
+        try:
+            require_real_benchmarks(
+                project_root,
+                ["mbpp_train", "mbpp_plus", "lcb_easy"],
+                path_overrides=overrides,
+                allow_synthetic=False,
+            )
+        except ConfigError as e:
+            raise SystemExit(
+                f"[error] Pipeline refuses to start without REAL benchmark data.\n{e}\n"
+                "Run: python src/prepare_data.py --download"
+            ) from e
+
     state = load_state(project_root, resume=args.resume, cycle_id=args.cycle_id)
     start_cycle = int(state.get("current_cycle", 0))
     config["_start_cycle"] = start_cycle

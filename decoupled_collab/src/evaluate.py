@@ -295,6 +295,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--judge_api", default="deepseek")
     parser.add_argument("--mock_judge", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument(
+        "--allow_synthetic",
+        action="store_true",
+        help="Allow synthetic/example fixtures (smoke only). Implied by --dry_run.",
+    )
     parser.add_argument("--cycle", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -313,26 +318,49 @@ def main(argv: Optional[list[str]] = None) -> None:
             "judge scores."
         )
 
+    allow_synthetic = bool(args.allow_synthetic or args.dry_run)
+
+    from utils.benchmarks import require_real_benchmark
+    from utils.failfast import ConfigError
+
+    try:
+        require_real_benchmark(
+            "mbpp_plus", Path(args.eval_data), allow_synthetic=allow_synthetic
+        )
+    except ConfigError as e:
+        if allow_synthetic and Path(args.eval_data).exists():
+            print(f"[warn] eval_data failed real-benchmark gate (allowed for dry_run): {e}")
+        else:
+            raise SystemExit(f"[error] {e}") from e
+
     mbpp_tasks = load_jsonl(args.eval_data)
-    lcb_tasks = load_jsonl(args.lcb_data)
+    lcb_tasks = load_jsonl(args.lcb_data) if args.lcb_data else []
     if not mbpp_tasks:
-        if args.dry_run:
-            raise SystemExit(
-                f"[error] eval_data is empty/missing: {args.eval_data}. "
-                "dry_run will not invent MBPP tasks — provide a real jsonl "
-                "(or the example fixtures) so results stay interpretable."
-            )
         raise SystemExit(
             f"[error] eval_data is empty/missing: {args.eval_data}. "
-            "Run prepare_data / download_assets first."
+            "Run: python src/prepare_data.py --download"
         )
-    if args.mode == "full" and args.lcb_data and not lcb_tasks and not args.dry_run:
-        raise SystemExit(
-            f"[error] LiveCodeBench file is empty/missing: {args.lcb_data}. "
-            "GOAL requires LCB-easy for contamination-free checks. Populate the "
-            "file or omit --lcb_data / use a mode that does not require it. "
-            "Refusing to report lcb_easy_pass1=null as if evaluation succeeded."
-        )
+    if args.mode == "full":
+        if not args.lcb_data:
+            raise SystemExit(
+                "[error] --mode full requires --lcb_data pointing at real "
+                "LiveCodeBench-easy jsonl (GOAL secondary benchmark)."
+            )
+        try:
+            require_real_benchmark(
+                "lcb_easy", Path(args.lcb_data), allow_synthetic=allow_synthetic
+            )
+        except ConfigError as e:
+            if allow_synthetic and Path(args.lcb_data).exists() and lcb_tasks:
+                print(f"[warn] lcb_data failed real-benchmark gate (allowed for dry_run): {e}")
+            elif allow_synthetic:
+                print(
+                    "[warn] dry_run full mode without real LCB — "
+                    "lcb_easy_pass1 will be null; not a valid GOAL check."
+                )
+            else:
+                raise SystemExit(f"[error] {e}") from e
+        lcb_tasks = load_jsonl(args.lcb_data)
 
     tags = [t.strip() for t in args.models.split(",") if t.strip()]
     if args.mode == "hypothesis_check":
