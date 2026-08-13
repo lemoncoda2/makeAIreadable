@@ -85,7 +85,7 @@ def require_thinking_support(tokenizer, *, enable_thinking: bool) -> None:
             "enable_thinking=True is required for this experiment, but "
             "tokenizer.apply_chat_template() rejects that keyword. "
             "Install a transformers build that supports Qwen3 thinking mode "
-            "(typically transformers>=4.51; requirements.txt pin 4.45.0 is too old). "
+            "(need transformers>=4.51; see GOAL Step 0.2 / requirements.txt). "
             f"Underlying error: {e}"
         ) from e
 

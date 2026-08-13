@@ -9,11 +9,22 @@ current_phase: null
 current_step: null
 last_checkpoint: null
 created: 2026-08-14
-hardware: 4×V100-32G (SSH direct)
+hardware: 4×V100-32G (SSH direct)  # Volta sm_70; FP16 only (no bf16)
 base_model: Qwen/Qwen3-4B (thinking mode)
 eval_api: deepseek-v4-flash (via OpenAI-compatible API)
 benchmark: MBPP+ (EvalPlus) + LiveCodeBench-easy
 project_dir: /path/to/decoupled_collab  # 修改为实际服务器路径
+# Recommended software stack for Qwen3-4B + V100-32G (see Step 0.2):
+software_stack:
+  python: "3.11"
+  cuda_runtime: "12.1 or 12.4 (driver >= that)"
+  torch: "2.5.1+cu121 or 2.6.0+cu124"   # FP16; avoid bf16
+  transformers: ">=4.51.0,<4.53"         # Qwen3 requires >=4.51 (else KeyError: qwen3)
+  vllm: "0.8.5"                         # Qwen3 needs >=0.8.5; V100 last common pip pin with sm_70
+  trl: "0.15.2"                         # GRPO; needs transformers>=4.46
+  peft: "0.14.0"
+  accelerate: "1.2.1"
+  inference_default: "huggingface+peft" # vLLM optional; adapter dirs need merge first
 ```
 
 ## Goal Summary
@@ -117,29 +128,82 @@ decoupled_collab/
 └── GOAL.md  # 本文件
 ```
 
-### Step 0.2: 安装依赖
+### Step 0.2: 安装依赖（Qwen3-4B × V100-32G 兼容栈）
+
+> **为何改 pin（相对初版 GOAL）**  
+> - 官方 Qwen3 卡：`transformers<4.51.0` → `KeyError: 'qwen3'`；thinking 需 `enable_thinking`（见 [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B)）。  
+> - Qwen 文档：部署用 `vllm>=0.8.5`。  
+> - V100 = **sm_70**：vLLM **v0.9+** 预编译镜像普遍丢掉 CC&lt;8.0；社区/官方 legacy 指引把 **`v0.8.5`** 当作仍带 Volta kernel 的常用上限（见 [vLLM production-stack V100 tutorial](https://github.com/vllm-project/production-stack/blob/main/tutorials/25-v100-legacy-gpu-deployment.md)）。  
+> - 因此 **Qwen3 + V100 的 pip 交集**：`transformers>=4.51` + **`vllm==0.8.5`**；训练主路径用 HF+PEFT（fp16），vLLM 仅作可选加速。  
+> - V100 **无 bf16 Tensor Core** → 全程 `float16` / `fp16=true`，禁止默认 bf16。
 
 ```bash
 conda create -n collab python=3.11 -y
 conda activate collab
 
-pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-pip install transformers==4.45.0
-pip install vllm==0.6.4
-pip install trl==0.12.0
-pip install peft==0.13.0
-pip install bitsandbytes==0.44.1
-pip install datasets==3.0.0
-pip install accelerate==1.0.0
-pip install deepspeed==0.15.0
-pip install openai           # DeepSeek API调用
-pip install evalplus          # MBPP+评估框架
-pip install wandb
-pip install jsonlines
-pip install rich
+# --- CUDA PyTorch (pick ONE; both OK on V100 if driver matches) ---
+# Option A (widely available):
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+  --index-url https://download.pytorch.org/whl/cu121
+# Option B (closer to Qwen "torch>=2.6" advice):
+# pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+#   --index-url https://download.pytorch.org/whl/cu124
+
+# --- Qwen3 + training stack ---
+pip install "transformers>=4.51.0,<4.53"
+pip install trl==0.15.2
+pip install peft==0.14.0
+pip install accelerate==1.2.1
+pip install datasets==3.2.0
+pip install bitsandbytes==0.45.0   # optional; V100 上优先 LoRA fp16，不必强依赖 4bit
+pip install deepspeed==0.15.4      # optional ZeRO; DDP+LoRA 通常够用
+pip install openai evalplus wandb jsonlines rich pyyaml tqdm huggingface_hub
+
+# --- Optional: vLLM for collect/regen (NOT required for GRPO/DPO) ---
+# Pin 0.8.5 for Qwen3 + V100 sm_70. Do NOT casually upgrade to 0.9+.
+pip install vllm==0.8.5
+export VLLM_USE_V1=0                 # V1 engine assumes CC>=8.0
+# Prefer: dtype=half, --enforce-eager on Volta if you hit CUDA-graph issues
 ```
 
-**检查点**: 运行 `python -c "import torch; print(torch.cuda.device_count())"` 输出 `4`
+或直接：
+
+```bash
+# from decoupled_collab/
+bash scripts/setup_env.sh
+```
+
+**V100 / Qwen3 运行约束（写进操作手册）**
+
+| 项 | 要求 |
+|----|------|
+| dtype | `float16` only（配置里 `torch_dtype: float16`, `fp16: true`, `bf16: false`） |
+| thinking | `enable_thinking=True`；缺则 fail-fast，禁止静默关掉 |
+| 训练并行 | `accelerate launch --num_processes 4`；GRPO `num_samples_per_prompt` 必须整除 `4 × per_device_batch_size`（默认 4） |
+| 推理默认 | HF + PEFT（`inference.use_vllm: false`） |
+| vLLM | 仅完整/merged 模型目录；LoRA adapter 目录禁止直喂；`VLLM_USE_V1=0` |
+| 采样（thinking） | Qwen 建议 temperature≈0.6, top_p≈0.95（相对旧 GOAL 的 0.7/0.9 可按阶段调） |
+
+**检查点**:
+```bash
+python - <<'PY'
+import torch, transformers
+print("torch", torch.__version__, "cuda", torch.cuda.is_available(), "ngpu", torch.cuda.device_count())
+assert torch.cuda.device_count() >= 1
+for i in range(torch.cuda.device_count()):
+    major, minor = torch.cuda.get_device_capability(i)
+    print(f"gpu{i}", torch.cuda.get_device_name(i), f"sm_{major}{minor}")
+    assert (major, minor) == (7, 0), "Expected V100 sm_70; adjust stack if different GPUs"
+print("transformers", transformers.__version__)
+assert tuple(int(x) for x in transformers.__version__.split(".")[:2]) >= (4, 51)
+try:
+    import vllm
+    print("vllm", vllm.__version__)
+except ImportError:
+    print("vllm not installed (OK if using HF-only inference)")
+PY
+```
+期望：`ngpu` 为 4，每张卡 `sm_70`，`transformers>=4.51`。
 
 ### Step 0.3: 下载模型和数据
 
