@@ -177,8 +177,20 @@ def fraction_executable_assert_tasks(tasks: list[dict[str, Any]]) -> float:
     return ok / len(tasks)
 
 
+def pass_task(model_output: str, task: dict[str, Any], *, timeout: int = 10) -> bool:
+    """Dispatch MBPP assert harness vs LiveCodeBench stdin/call harness."""
+    from utils.lcb_executor import pass_lcb, task_lcb_cases
+
+    if task.get("harness") == "lcb" or task_lcb_cases(task):
+        code = extract_code(model_output)
+        return pass_lcb(code, task, timeout=timeout)
+    return pass_at_1(model_output, task.get("test_cases") or [], timeout=timeout)
+
+
 def evaluate_benchmark(tasks: list[dict[str, Any]], outputs: list[str]) -> dict[str, float]:
-    passes = [pass_at_1(o, t.get("test_cases") or []) for o, t in zip(outputs, tasks)]
+    from utils.lcb_executor import fraction_lcb_ready
+
+    passes = [pass_task(o, t) for o, t in zip(outputs, tasks)]
     codes = [extract_code(o) for o in outputs]
     return {
         "pass_at_1": mean(float(p) for p in passes),
@@ -186,6 +198,7 @@ def evaluate_benchmark(tasks: list[dict[str, Any]], outputs: list[str]) -> dict[
         "syntax_error_rate": syntax_error_rate(codes),
         "n": float(len(tasks)),
         "executable_assert_task_frac": fraction_executable_assert_tasks(tasks),
+        "lcb_ready_frac": fraction_lcb_ready(tasks),
     }
 
 
@@ -286,21 +299,22 @@ def evaluate_model(
         result["avg_code_length"] = mbpp["avg_code_length"]
         result["syntax_error_rate"] = mbpp["syntax_error_rate"]
         if lcb_eval:
-            exec_frac = fraction_executable_assert_tasks(lcb_eval)
-            if exec_frac < 0.5 and not dry_run:
+            from utils.lcb_executor import fraction_lcb_ready
+
+            lcb_frac = fraction_lcb_ready(lcb_eval)
+            if lcb_frac < 0.5 and not dry_run:
                 raise SystemExit(
-                    f"[error] LiveCodeBench tasks have executable assert coverage "
-                    f"{exec_frac:.0%} (<50%). JSON stdin blobs are not runnable by "
-                    "code_executor — lcb_easy_pass1 would be a fake near-zero metric. "
-                    "Convert public tests to assert strings in data/lcb_easy.jsonl, "
-                    "or omit LCB until a proper harness exists."
+                    f"[error] LiveCodeBench tasks have structured lcb_tests coverage "
+                    f"{lcb_frac:.0%} (<50%). Re-run: python src/prepare_data.py --download "
+                    "(stores harness=lcb + stdin/call cases). "
+                    "Do not use assert-only fixtures for LCB."
                 )
             lcb_outs = generate_for_model(
                 model_tag, model_path, base_model_path, lcb_eval, dry_run=dry_run
             )
             lcb = evaluate_benchmark(lcb_eval, lcb_outs)
             result["lcb_easy_pass1"] = lcb["pass_at_1"]
-            result["lcb_executable_assert_frac"] = exec_frac
+            result["lcb_ready_frac"] = lcb_frac
         else:
             result["lcb_easy_pass1"] = None
 

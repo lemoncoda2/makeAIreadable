@@ -54,38 +54,93 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_preference_dataset(train_file: Path, eval_split: float = 0.05):
+def _render_preference_row(item: Dict[str, Any], tokenizer) -> Dict[str, str]:
+    """Render one DPO row so prompt matches regen/inference chat template."""
+    from utils.prompts import DPO_PROMPT_FORMAT, render_dpo_prompt
+
+    chosen = item.get("chosen")
+    rejected = item.get("rejected")
+    if chosen is None or rejected is None:
+        raise ValueError(
+            f"DPO jsonl rows must have chosen/rejected; got keys={list(item.keys())}"
+        )
+
+    meta = item.get("metadata") or {}
+    task_prompt = meta.get("task_prompt", item.get("task_prompt"))
+    thinking = meta.get("thinking", item.get("thinking"))
+    code = meta.get("code", item.get("code"))
+    fmt = meta.get("prompt_format")
+
+    legacy_prompt = item.get("prompt")
+    if isinstance(legacy_prompt, str) and "<system>" in legacy_prompt and "<user>" in legacy_prompt:
+        if task_prompt is None or thinking is None or code is None:
+            raise ValueError(
+                "Legacy fake-XML DPO prompt detected without work-trace metadata. "
+                "Re-run filter_pairs.py so rows include metadata.task_prompt/thinking/code "
+                f"and prompt_format={DPO_PROMPT_FORMAT!r}."
+            )
+
+    if task_prompt is not None and thinking is not None and code is not None:
+        prompt = render_dpo_prompt(tokenizer, str(task_prompt), str(thinking), str(code))
+    elif item.get("messages"):
+        from utils.model_utils import apply_chat_template_with_thinking
+
+        prompt = apply_chat_template_with_thinking(
+            tokenizer,
+            item["messages"],
+            enable_thinking=False,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+    elif isinstance(legacy_prompt, str) and legacy_prompt.strip():
+        # Only allow non-XML legacy prompts (should be rare).
+        prompt = legacy_prompt
+        print(
+            "[warn] DPO row missing work-trace metadata; using raw prompt string. "
+            f"prompt_format={fmt!r}"
+        )
+    else:
+        raise ValueError(
+            "Cannot render DPO prompt: need metadata "
+            "{task_prompt, thinking, code} or messages. "
+            f"keys={list(item.keys())} metadata_keys={list(meta.keys())}"
+        )
+
+    return {"prompt": prompt, "chosen": str(chosen), "rejected": str(rejected)}
+
+
+def load_preference_dataset(
+    train_file: Path,
+    tokenizer,
+    eval_split: float = 0.05,
+):
     """
-    Load jsonl with fields: prompt, chosen, rejected.
+    Load preference jsonl and render prompts with the Qwen chat template
+    used by regen_collaboration (enable_thinking=False).
+
     Returns (train_dataset, eval_dataset|None).
     """
     from datasets import Dataset
 
     rows = []
     with train_file.open("r", encoding="utf-8") as f:
-        for line in f:
+        for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             item = json.loads(line)
-            prompt = item.get("prompt")
-            chosen = item.get("chosen")
-            rejected = item.get("rejected")
-            if prompt is None or chosen is None or rejected is None:
-                raise ValueError(
-                    f"DPO jsonl rows must have prompt/chosen/rejected; got keys={list(item.keys())}"
-                )
-            rows.append(
-                {
-                    "prompt": prompt,
-                    "chosen": chosen,
-                    "rejected": rejected,
-                }
-            )
+            try:
+                rows.append(_render_preference_row(item, tokenizer))
+            except ValueError as e:
+                raise ValueError(f"{train_file}:{line_no}: {e}") from e
 
     if not rows:
         raise ValueError(f"No DPO pairs found in {train_file}")
 
+    print(
+        f"[info] Rendered {len(rows)} DPO prompts with Qwen chat template "
+        "(regen messages, enable_thinking=False)"
+    )
     ds = Dataset.from_list(rows)
     eval_ds = None
     if eval_split and 0.0 < float(eval_split) < 1.0 and len(ds) >= 20:
@@ -280,7 +335,9 @@ def main() -> int:
     tokenizer = load_tokenizer(base_model)
 
     eval_split = float(cfg.get("data", {}).get("eval_split", 0.05))
-    train_ds, eval_ds = load_preference_dataset(dpo_data, eval_split=eval_split)
+    train_ds, eval_ds = load_preference_dataset(
+        dpo_data, tokenizer, eval_split=eval_split
+    )
     print(
         f"[info] DPO pairs: train={len(train_ds)}"
         + (f", eval={len(eval_ds)}" if eval_ds is not None else "")

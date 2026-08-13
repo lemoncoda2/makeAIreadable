@@ -49,6 +49,7 @@ See `decoupled_collab/README.md` and `decoupled_collab/GOAL.md` for Phase 0–5.
 - DPO resumes the RL LoRA only (refuses fresh LoRA on base). Reference is PEFT-implicit (`ref_model=None`) to avoid 2× weights OOM on 32G V100.
 - `pipeline_state.json`: `current_phase` means **next phase to run**. `--resume` after `status=completed` is refused.
 - `bash scripts/smoke_test.sh` writes only under `data/smoke/` — it must never overwrite real `data/mbpp_*.jsonl` / `data/lcb_easy.jsonl`.
-- Empty `test_cases` never count as pass@1. LCB eval requires ≥50% assert-style tests (JSON stdin blobs are rejected).
+- Empty `test_cases` never count as pass@1. LCB uses `harness=lcb` + `lcb_tests` (stdin/call) via `utils/lcb_executor.py` (official-style); not MBPP asserts.
+- DPO prompts are re-rendered in `train_dpo.py` with the same Qwen chat template as `regen_collaboration` (`enable_thinking=False`). Fake `<system>/<user>` XML is refused.
 - `--dry_run` and `--mock_judge` are explicit only. dry-run eval of readability requires `--mock_judge`. Placeholder dirs contain `DRY_RUN_PLACEHOLDER` and are refused by real loads.
 - `inference.use_vllm` defaults to `false` (HF+PEFT). vLLM + LoRA adapter path fails fast unless merged.
