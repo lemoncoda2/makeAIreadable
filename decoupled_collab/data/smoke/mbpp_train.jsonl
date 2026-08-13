@@ -1,0 +1,2 @@
+{"task_id": "mbpp_1", "prompt": "Write a function to add two numbers.", "test_cases": ["assert add(1, 2) == 3", "assert add(0, 0) == 0"], "code_solution": "def add(a, b):\n    return a + b\n", "source": "mbpp_full", "benchmark": "mbpp_train", "synthetic": true}
+{"task_id": "mbpp_2", "prompt": "Write a function to return the maximum of two numbers.", "test_cases": ["assert maximum(1, 2) == 2"], "code_solution": "def maximum(a, b):\n    return a if a > b else b\n", "source": "mbpp_full", "benchmark": "mbpp_train", "synthetic": true}

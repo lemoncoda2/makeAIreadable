@@ -156,11 +156,25 @@ def build_reward_func(timeout: int = 10, max_test_cases: int = 5):
             )
         tcs_batch = list(test_cases)
         if len(tcs_batch) != n:
-            raise RuntimeError(
-                f"GRPO reward length mismatch: len(completions)={n} but "
-                f"len(test_cases)={len(tcs_batch)}. Refusing to pad/truncate "
-                "silently (wrong rewards would be hard to debug)."
-            )
+            # TRL GRPO expands each prompt into num_generations completions.
+            # Common layout: completions grouped per prompt, so n = len(tcs) * G.
+            if len(tcs_batch) > 0 and n % len(tcs_batch) == 0:
+                repeat = n // len(tcs_batch)
+                expanded: list = []
+                for tc in tcs_batch:
+                    expanded.extend([tc] * repeat)
+                tcs_batch = expanded
+                print(
+                    f"[info] Expanded test_cases x{repeat} to match "
+                    f"{n} completions (GRPO num_generations alignment)"
+                )
+            else:
+                raise RuntimeError(
+                    f"GRPO reward length mismatch: len(completions)={n} but "
+                    f"len(test_cases)={len(tcs_batch)}. Expected equal lengths "
+                    "or completions divisible by test_cases (num_generations). "
+                    "Refusing to invent alignment."
+                )
 
         rewards = []
         for text, tcs in zip(texts, tcs_batch):

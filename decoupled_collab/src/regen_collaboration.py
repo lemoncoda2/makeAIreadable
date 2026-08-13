@@ -132,28 +132,43 @@ class RegenGenerator:
             self._device = model_input_device(self.model)
 
     def generate(self, trace: dict[str, Any]) -> str:
+        from utils.model_utils import apply_chat_template_with_thinking
+
         messages = messages_for_trace(trace)
-        text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        # Collaboration-only regen must NOT run in Qwen3 thinking mode.
+        text = apply_chat_template_with_thinking(
+            self.tokenizer,
+            messages,
+            enable_thinking=False,
+            tokenize=False,
+            add_generation_prompt=True,
         )
         if self.use_vllm:
             outputs = self.llm.generate([text], self.sampling_params)
-            return outputs[0].outputs[0].text.strip()
+            raw = outputs[0].outputs[0].text.strip()
+        else:
+            import torch
 
-        import torch
+            inputs = self.tokenizer(text, return_tensors="pt")
+            inputs = {k: v.to(self._device) for k, v in inputs.items()}
+            with torch.no_grad():
+                out = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    temperature=self.temperature,
+                    do_sample=self.temperature > 0,
+                    top_p=0.9,
+                )
+            gen = out[0][inputs["input_ids"].shape[1] :]
+            raw = self.tokenizer.decode(gen, skip_special_tokens=True).strip()
 
-        inputs = self.tokenizer(text, return_tensors="pt")
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
-        with torch.no_grad():
-            out = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                do_sample=self.temperature > 0,
-                top_p=0.9,
+        if "<think>" in raw or "</think>" in raw:
+            raise RuntimeError(
+                "Regen output still contains <think> tags despite enable_thinking=False. "
+                "Refusing to write polluted collaboration into DPO pairs. "
+                f"Snippet: {raw[:200]!r}"
             )
-        gen = out[0][inputs["input_ids"].shape[1] :]
-        return self.tokenizer.decode(gen, skip_special_tokens=True).strip()
+        return raw
 
 
 def make_raw_pair(trace: dict[str, Any], regen_collaboration: str) -> dict[str, Any]:

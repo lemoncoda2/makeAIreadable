@@ -9,9 +9,11 @@ grpo:
 dpo:
   config: configs/dpo_config.yaml
   threshold: 6.0
+  # Fail filter phase if fewer pairs kept (GOAL suggests ≥1500).
+  min_pairs: 1500
 inference:
-  # false: HuggingFace+PEFT (supports LoRA adapter dirs).
-  # true: vLLM — ONLY for full merged model dirs; adapter_config.json will fail-fast.
+  # false: HuggingFace+PEFT (supports LoRA adapter dirs) — recommended on V100.
+  # true: pipeline merges LoRA → model_rl_merged via src/merge_lora.py before collect.
   use_vllm: false
 eval:
   num_tasks_benchmark: 200

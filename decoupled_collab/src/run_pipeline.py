@@ -96,6 +96,40 @@ def save_state(project_root: Path, state: dict[str, Any]) -> None:
         json.dump(state, f, indent=2)
 
 
+def next_phase_after(phase: str) -> Optional[str]:
+    """Return the phase that should run after a successful `phase`, or None if cycle done."""
+    try:
+        idx = PHASES.index(phase)
+    except ValueError:
+        return PHASES[0]
+    if idx + 1 < len(PHASES):
+        return PHASES[idx + 1]
+    return None
+
+
+def advance_state_after_phase(state: dict[str, Any], phase: str, cycle: int) -> None:
+    """
+    After a phase succeeds, point state at the *next* work unit.
+
+    ``current_phase`` always means "next phase to run" (not the one just finished),
+    so ``--resume`` does not re-execute a completed phase.
+    """
+    nxt = next_phase_after(phase)
+    if nxt is not None:
+        state["current_phase"] = nxt
+        state["current_cycle"] = cycle
+    else:
+        state["current_phase"] = PHASES[0]
+        state["current_cycle"] = cycle + 1
+        state.setdefault("history", []).append(
+            {
+                "cycle": cycle,
+                "completed": datetime.now(timezone.utc).isoformat(),
+                "results": f"./results/cycle_{cycle}_eval.json",
+            }
+        )
+
+
 def phases_from(current_phase: Optional[str]) -> list[str]:
     """Return PHASES slice starting at current_phase; safe if phase missing."""
     if not current_phase:
@@ -226,6 +260,11 @@ def run_phase(
             log_dir / "grpo.log",
             cwd=project_root,
         )
+        if not (out / "adapter_config.json").exists():
+            raise RuntimeError(
+                f"GRPO finished but {out}/adapter_config.json is missing. "
+                "Refusing to mark phase complete."
+            )
 
     elif phase == "phase1_eval":
         rl_path = cycle_dir / "model_rl"
@@ -233,6 +272,10 @@ def run_phase(
             from utils.failfast import assert_not_dry_run_placeholder
 
             assert_not_dry_run_placeholder(rl_path, what="phase1_eval rl_model")
+            if not (rl_path / "adapter_config.json").exists():
+                raise RuntimeError(
+                    f"phase1_eval: missing LoRA adapter at {rl_path}/adapter_config.json"
+                )
         out = cycle_dir / "phase1_check.json"
         mock = " --mock_judge" if dry_run else ""
         if dry_run and not mock.strip():
@@ -254,11 +297,31 @@ def run_phase(
             from utils.failfast import assert_not_dry_run_placeholder
 
             assert_not_dry_run_placeholder(rl_path, what="phase2_collect model")
+            if not (rl_path / "adapter_config.json").exists():
+                raise RuntimeError(
+                    f"phase2_collect: missing LoRA adapter at {rl_path}/adapter_config.json"
+                )
+        collect_model = rl_path
+        if use_vllm and not dry_run:
+            merged = cycle_dir / "model_rl_merged"
+            merge_script = project_root / "src" / "merge_lora.py"
+            run_cmd(
+                f"{py} {shlex.quote(str(merge_script))} "
+                f"--base_model {shlex.quote(base_model)} "
+                f"--adapter {shlex.quote(str(rl_path))} "
+                f"--output {shlex.quote(str(merged))}",
+                log_dir / "merge_lora.log",
+                cwd=project_root,
+            )
+            collect_model = merged
         out = resolve_path(project_root, f"./data/traces/cycle_{cycle}_traces.jsonl")
+        # Fresh collect for this cycle — avoid mixing stale task_ids from older models.
+        if out.exists() and not dry_run:
+            out.unlink()
         train_tasks = resolve_path(project_root, "./data/mbpp_train.jsonl")
         run_cmd(
             f"{py} src/collect_traces.py "
-            f"--model {shlex.quote(str(rl_path))} "
+            f"--model {shlex.quote(str(collect_model))} "
             f"--base_model_path {shlex.quote(base_model)} "
             f"--tasks {shlex.quote(str(train_tasks))} "
             f"--output {shlex.quote(str(out))} "
@@ -272,6 +335,8 @@ def run_phase(
     elif phase == "phase3_regen":
         traces = resolve_path(project_root, f"./data/traces/cycle_{cycle}_traces.jsonl")
         out = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_raw.jsonl")
+        if out.exists() and not dry_run:
+            out.unlink()
         run_cmd(
             f"{py} src/regen_collaboration.py "
             f"--base_model {shlex.quote(base_model)} "
@@ -287,11 +352,15 @@ def run_phase(
         raw = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_raw.jsonl")
         out = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_filtered.jsonl")
         mock = " --mock_judge" if dry_run else ""
+        min_pairs = int(config.get("dpo", {}).get("min_pairs", 1500))
+        if dry_run:
+            min_pairs = 1
         run_cmd(
             f"{py} src/filter_pairs.py "
             f"--raw_pairs {shlex.quote(str(raw))} "
             f"--output {shlex.quote(str(out))} "
-            f"--judge_api deepseek --threshold {threshold}{mock}",
+            f"--judge_api deepseek --threshold {threshold} "
+            f"--min_pairs {min_pairs}{mock}",
             log_dir / "filter.log",
             cwd=project_root,
         )
@@ -319,14 +388,21 @@ def run_phase(
             raise FileNotFoundError(
                 f"Missing {train_script}. Implement DPO training before running without --dry_run."
             )
+        os.environ["ACCELERATE_NUM_PROCESSES"] = str(num_gpus)
         run_cmd(
-            f"{py} {shlex.quote(str(train_script))} --config {shlex.quote(str(dpo_cfg))} "
+            f"accelerate launch --num_processes {num_gpus} {shlex.quote(str(train_script))} "
+            f"--config {shlex.quote(str(dpo_cfg))} "
             f"--model {shlex.quote(model)} "
             f"--dpo_data {shlex.quote(str(dpo_data))} "
             f"--output {shlex.quote(str(out))}",
             log_dir / "dpo.log",
             cwd=project_root,
         )
+        if not (out / "adapter_config.json").exists():
+            raise RuntimeError(
+                f"DPO finished but {out}/adapter_config.json is missing. "
+                "Refusing to mark phase complete."
+            )
 
     elif phase == "phase4_eval":
         if not dry_run:
@@ -338,6 +414,14 @@ def run_phase(
             assert_not_dry_run_placeholder(
                 cycle_dir / "model_rl_dpo", what="phase4_eval final_model"
             )
+            for tag, p in (
+                ("rl", cycle_dir / "model_rl"),
+                ("final", cycle_dir / "model_rl_dpo"),
+            ):
+                if not (p / "adapter_config.json").exists():
+                    raise RuntimeError(
+                        f"phase4_eval: missing adapter_config.json for {tag} at {p}"
+                    )
         out = resolve_path(project_root, f"./results/cycle_{cycle}_eval.json")
         mock = " --mock_judge" if dry_run else ""
         run_cmd(
@@ -413,9 +497,20 @@ def main(argv: Optional[list[str]] = None) -> None:
             ) from e
 
     state = load_state(project_root, resume=args.resume, cycle_id=args.cycle_id)
+    if args.resume and state.get("status") == "completed":
+        raise SystemExit(
+            "[error] pipeline_state.json status=completed. Refusing --resume "
+            "(would re-run finished cycles). Delete the state file to start fresh."
+        )
     start_cycle = int(state.get("current_cycle", 0))
     config["_start_cycle"] = start_cycle
     num_cycles = int(config["general"].get("num_cycles", 2))
+
+    if start_cycle >= num_cycles:
+        raise SystemExit(
+            f"[error] current_cycle={start_cycle} >= num_cycles={num_cycles}. "
+            "Nothing left to run; delete pipeline_state.json to restart."
+        )
 
     if args.only_phase:
         if args.only_phase not in PHASES:
@@ -432,20 +527,23 @@ def main(argv: Optional[list[str]] = None) -> None:
             start_model=args.start_model,
             dry_run=args.dry_run,
         )
+        advance_state_after_phase(state, args.only_phase, cycle)
         save_state(project_root, state)
         print("✓ Single phase completed")
         return
 
     for cycle in range(start_cycle, num_cycles):
         state["current_cycle"] = cycle
-        # On first cycle of this run, continue from saved phase; later cycles restart
+        # On first cycle of this run, continue from saved *next* phase; later cycles restart
         if cycle == start_cycle:
             phases_to_run = phases_from(state.get("current_phase"))
         else:
             phases_to_run = list(PHASES)
 
         for phase in phases_to_run:
+            # Persist the phase we are about to run (crash mid-phase → re-run same phase).
             state["current_phase"] = phase
+            state["status"] = "running"
             save_state(project_root, state)
 
             print(f"\n{'=' * 60}")
@@ -459,16 +557,9 @@ def main(argv: Optional[list[str]] = None) -> None:
                 start_model=args.start_model,
                 dry_run=args.dry_run,
             )
-
-        state["current_phase"] = PHASES[0]
-        state.setdefault("history", []).append(
-            {
-                "cycle": cycle,
-                "completed": datetime.now(timezone.utc).isoformat(),
-                "results": f"./results/cycle_{cycle}_eval.json",
-            }
-        )
-        save_state(project_root, state)
+            # Advance to next phase *after* success so --resume skips completed work.
+            advance_state_after_phase(state, phase, cycle)
+            save_state(project_root, state)
 
     state["status"] = "completed"
     save_state(project_root, state)

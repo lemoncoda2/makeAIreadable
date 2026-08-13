@@ -42,9 +42,13 @@ See `decoupled_collab/README.md` and `decoupled_collab/GOAL.md` for Phase 0–5.
 
 - Run all training scripts with cwd = `decoupled_collab/` so relative paths in YAML resolve.
 - **Fail-fast policy**: no silent fallbacks for thinking mode, missing `test_cases`, wrong PEFT args, dry-run placeholder checkpoints, vLLM+LoRA adapter dirs, or unparseable judge JSON. Fix the cause; do not “soft continue”.
-- Qwen3 thinking mode requires `enable_thinking=True` and **`transformers>=4.51`** (official; older → `KeyError: qwen3`).
+- Qwen3 thinking mode requires `enable_thinking=True` and **`transformers>=4.51`** (official; older → `KeyError: qwen3`). Regen collaboration uses `enable_thinking=False` (must pass the kwarg; Qwen3 defaults thinking-ON if omitted).
 - Recommended V100 stack (GOAL Step 0.2): `torch 2.5.1+cu121` (or `2.6.0+cu124`), `transformers>=4.51,<4.53`, optional **`vllm==0.8.5`** + `VLLM_USE_V1=0`. Do not casually use vLLM≥0.9 prebuilt on sm_70.
-- FP16 only on V100 (`bf16=false`). Training path is HF+PEFT; vLLM is optional for collect/regen after merge.
-- GRPO reward is **code-execution only**; missing `test_cases` in the reward kwargs aborts training.
+- FP16 only on V100 (`bf16=false`). Training path is HF+PEFT; vLLM is optional for collect/regen after merge (`src/merge_lora.py`; pipeline auto-merges when `inference.use_vllm: true`).
+- GRPO reward is **code-execution only**; missing `test_cases` in the reward kwargs aborts training. TRL expands `test_cases` × `num_generations` when lengths differ by that factor.
+- DPO resumes the RL LoRA only (refuses fresh LoRA on base). Reference is PEFT-implicit (`ref_model=None`) to avoid 2× weights OOM on 32G V100.
+- `pipeline_state.json`: `current_phase` means **next phase to run**. `--resume` after `status=completed` is refused.
+- `bash scripts/smoke_test.sh` writes only under `data/smoke/` — it must never overwrite real `data/mbpp_*.jsonl` / `data/lcb_easy.jsonl`.
+- Empty `test_cases` never count as pass@1. LCB eval requires ≥50% assert-style tests (JSON stdin blobs are rejected).
 - `--dry_run` and `--mock_judge` are explicit only. dry-run eval of readability requires `--mock_judge`. Placeholder dirs contain `DRY_RUN_PLACEHOLDER` and are refused by real loads.
-- `inference.use_vllm` defaults to `false` (HF+PEFT). vLLM + LoRA adapter path fails fast.
+- `inference.use_vllm` defaults to `false` (HF+PEFT). vLLM + LoRA adapter path fails fast unless merged.

@@ -97,31 +97,40 @@ python src/evaluate.py --mode hypothesis_check \
 ## Phase 2 — Collect traces
 
 ```bash
+# HF+PEFT (default; LoRA adapter dir OK). For vLLM: merge first, then --use_vllm true.
+# python src/merge_lora.py --base_model ./models/Qwen3-4B \
+#   --adapter ./checkpoints/cycle_0/model_rl --output ./checkpoints/cycle_0/model_rl_merged
 python src/collect_traces.py \
   --model ./checkpoints/cycle_0/model_rl \
   --base_model_path ./models/Qwen3-4B \
   --tasks ./data/mbpp_train.jsonl \
-  --output ./data/traces/cycle_0_rl_traces.jsonl \
+  --output ./data/traces/cycle_0_traces.jsonl \
   --num_tasks 2000 --temperature 0.7 --max_new_tokens 768 \
-  --enable_thinking true --use_vllm true
+  --enable_thinking true --use_vllm false
 # Offline: add --dry_run
 ```
 
 ## Phase 3 — Regen + filter + DPO
 
+Filenames match `run_pipeline.py` (`cycle_N_traces.jsonl`, `cycle_N_raw.jsonl`, `cycle_N_filtered.jsonl`).
+
 ```bash
 python src/regen_collaboration.py \
   --base_model ./models/Qwen3-4B \
-  --traces ./data/traces/cycle_0_rl_traces.jsonl \
-  --output ./data/dpo_pairs/cycle_0_raw_pairs.jsonl \
-  --num_samples 3000 --use_vllm true
+  --traces ./data/traces/cycle_0_traces.jsonl \
+  --output ./data/dpo_pairs/cycle_0_raw.jsonl \
+  --num_samples 3000 --use_vllm false
 
 python src/filter_pairs.py \
-  --raw_pairs ./data/dpo_pairs/cycle_0_raw_pairs.jsonl \
-  --output ./data/dpo_pairs/cycle_0_filtered_pairs.jsonl \
-  --judge_api deepseek --threshold 6.0 --batch_size 20 --max_concurrent 5
+  --raw_pairs ./data/dpo_pairs/cycle_0_raw.jsonl \
+  --output ./data/dpo_pairs/cycle_0_filtered.jsonl \
+  --judge_api deepseek --threshold 6.0 --min_pairs 1500 \
+  --batch_size 20 --max_concurrent 5
 
-python src/train_dpo.py --config configs/dpo_config.yaml
+python src/train_dpo.py --config configs/dpo_config.yaml \
+  --model ./checkpoints/cycle_0/model_rl \
+  --dpo_data ./data/dpo_pairs/cycle_0_filtered.jsonl \
+  --output ./checkpoints/cycle_0/model_rl_dpo
 ```
 
 ## Phase 4 — Full evaluation

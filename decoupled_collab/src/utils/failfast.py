@@ -106,7 +106,18 @@ def apply_chat_template_thinking_strict(
         **kwargs,
     )
     if not enable_thinking:
-        return tokenizer.apply_chat_template(messages, **base)
+        # Qwen3 defaults to thinking-ON when the kwarg is omitted — must pass False.
+        try:
+            return tokenizer.apply_chat_template(
+                messages, enable_thinking=False, **base
+            )
+        except TypeError as e:
+            raise RuntimeError(
+                "Refusing to omit enable_thinking=False. Qwen3 chat templates default "
+                "to thinking mode when the flag is absent, which would pollute "
+                "collaboration-only regen with <think> text. "
+                f"Underlying error: {e}"
+            ) from e
     try:
         return tokenizer.apply_chat_template(
             messages, enable_thinking=True, **base

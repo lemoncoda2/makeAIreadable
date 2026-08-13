@@ -1,0 +1,1 @@
+{"task_id": "Mbpp/101", "prompt": "Write a function to check if a number is even.", "test_cases": ["assert is_even(2) == True", "assert is_even(3) == False"], "entry_point": "is_even", "code_solution": "def is_even(n):\n    return n % 2 == 0\n", "source": "evalplus_mbpp_plus", "benchmark": "mbpp_plus", "synthetic": true}
