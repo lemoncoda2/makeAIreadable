@@ -11,6 +11,23 @@ local/cloud agents can use `--dry_run` / `--mock_judge` for offline pipeline che
 dry-run placeholder checkpoints, vLLM+LoRA adapter dirs, unparseable judge JSON, GRPO
 batch/generations mismatch). Prefer a loud error over a fake success.
 
+### Recommended env (Qwen3-4B × 4×V100-32G)
+
+| Component | Pin / note |
+|-----------|------------|
+| Python | 3.11 |
+| PyTorch | `2.5.1+cu121` or `2.6.0+cu124` (FP16 only) |
+| transformers | `>=4.51,<4.53` (Qwen3 hard requirement) |
+| trl / peft / accelerate | `0.15.2` / `0.14.0` / `1.2.1` |
+| vLLM (optional) | **`0.8.5`** + `VLLM_USE_V1=0` (Qwen3 ∩ V100 sm_70); skip if wheel fails |
+
+```bash
+bash scripts/setup_env.sh          # INSTALL_VLLM=0 to skip vLLM
+# or TORCH_VER=2.6.0 TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu124 bash scripts/setup_env.sh
+```
+
+Details and rationale: `GOAL.md` Step 0.2 / root `GOAL_decoupled_collaboration.md`.
+
 ## Layout
 
 ```

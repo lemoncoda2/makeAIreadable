@@ -1,24 +1,25 @@
-# Decoupled Collaboration Training — Python dependencies (GOAL Step 0.2)
+# Decoupled Collaboration — pins for Qwen3-4B on 4×V100-32G (sm_70)
 #
-# Install PyTorch with CUDA 12.1 first (V100 server):
-#   pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+# Install PyTorch FIRST (pick one):
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+#   # or: pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 #
-# Then:
-#   pip install -r requirements.txt
+# Then: pip install -r requirements.txt
 #
-# WARNING (fail-fast): GOAL pinned transformers==4.45.0 / vllm==0.6.4, but Qwen3
-# thinking mode typically needs newer transformers (>=4.51). Scripts will ERROR
-# if enable_thinking is unsupported — do NOT silence that. Align versions on the
-# V100 box before a real run; pins below are starting points, not a guarantee.
+# Compatibility notes (research snapshot):
+# - Qwen3 requires transformers>=4.51.0 (else KeyError: qwen3 / no enable_thinking)
+# - Qwen docs recommend vllm>=0.8.5 for Qwen3 serving
+# - V100 (sm_70): vLLM 0.9+ prebuilt images commonly drop CC<8.0; pin vllm==0.8.5
+# - Use FP16 only on V100 (no bf16). Prefer HF+PEFT for training; vLLM optional.
+# - If vllm 0.8.5 wheel fails on your driver, omit vllm and keep inference.use_vllm=false
 
-transformers==4.45.0
-vllm==0.6.4
-trl==0.12.0
-peft==0.13.0
-bitsandbytes==0.44.1
-datasets==3.0.0
-accelerate==1.0.0
-deepspeed==0.15.0
+transformers>=4.51.0,<4.53
+trl==0.15.2
+peft==0.14.0
+accelerate==1.2.1
+datasets==3.2.0
+bitsandbytes==0.45.0
+deepspeed==0.15.4
 openai>=1.40.0
 evalplus
 wandb
@@ -28,3 +29,6 @@ pyyaml>=6.0
 tqdm
 pytest>=7.0
 huggingface_hub
+
+# Optional inference accelerator (Qwen3 + V100 intersection):
+# vllm==0.8.5
