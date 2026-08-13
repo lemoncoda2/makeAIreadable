@@ -5,8 +5,10 @@ __pycache__/
 pipeline_state.json
 data/traces/*.jsonl
 data/dpo_pairs/*.jsonl
-data/mbpp_*.jsonl
+data/mbpp_train.jsonl
+data/mbpp_plus_test.jsonl
 data/lcb_easy.jsonl
+!data/*.example.jsonl
 data/raw/**
 !data/raw/.gitkeep
 !data/traces/.gitkeep
