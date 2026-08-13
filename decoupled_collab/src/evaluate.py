@@ -45,10 +45,12 @@ def mean(values) -> float:
 
 
 def pass_at_1(model_output: str, test_cases: list[str], timeout: int = 10) -> bool:
-    """True if reward == 1.0 (all capped tests pass) or no tests with extractable code."""
+    """True only when code extracts and every provided test executes successfully.
+
+    Empty/missing test_cases never count as a pass (that was a fake-success footgun).
+    """
     if not test_cases:
-        return bool(extract_code(model_output))
-    # Use full test list for eval (not capped to 5)
+        return False
     from utils.code_executor import execute_test
 
     code = extract_code(model_output)
@@ -159,6 +161,22 @@ class ModelRunner:
         return self.tokenizer.decode(gen, skip_special_tokens=False)
 
 
+def _is_executable_assert(tc: Any) -> bool:
+    return isinstance(tc, str) and tc.strip().startswith("assert")
+
+
+def fraction_executable_assert_tasks(tasks: list[dict[str, Any]]) -> float:
+    """Share of tasks whose test_cases are assert-style strings (code_executor-ready)."""
+    if not tasks:
+        return 0.0
+    ok = 0
+    for t in tasks:
+        tcs = t.get("test_cases") or []
+        if tcs and all(_is_executable_assert(x) for x in tcs):
+            ok += 1
+    return ok / len(tasks)
+
+
 def evaluate_benchmark(tasks: list[dict[str, Any]], outputs: list[str]) -> dict[str, float]:
     passes = [pass_at_1(o, t.get("test_cases") or []) for o, t in zip(outputs, tasks)]
     codes = [extract_code(o) for o in outputs]
@@ -167,6 +185,7 @@ def evaluate_benchmark(tasks: list[dict[str, Any]], outputs: list[str]) -> dict[
         "avg_code_length": mean(float(len(c)) for c in codes),
         "syntax_error_rate": syntax_error_rate(codes),
         "n": float(len(tasks)),
+        "executable_assert_task_frac": fraction_executable_assert_tasks(tasks),
     }
 
 
@@ -212,10 +231,29 @@ def generate_for_model(
     *,
     dry_run: bool,
 ) -> list[str]:
-    if dry_run or not model_path:
+    if dry_run:
         return [dry_run_generation(t, model_tag) for t in tasks]
+    if not model_path:
+        raise SystemExit(
+            f"[error] evaluate: model path for tag={model_tag!r} is missing. "
+            "Refusing to inject ground-truth dry_run_generation stubs outside --dry_run "
+            "(that would fake pass@1 / readability)."
+        )
     runner = ModelRunner(model_path, base_model_path=base_model_path)
-    return [runner.generate(t["prompt"]) for t in tasks]
+    try:
+        return [runner.generate(t["prompt"]) for t in tasks]
+    finally:
+        # Free VRAM before loading the next model tag (base → rl → final).
+        del runner
+        try:
+            import torch
+            import gc
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def evaluate_model(
@@ -248,11 +286,21 @@ def evaluate_model(
         result["avg_code_length"] = mbpp["avg_code_length"]
         result["syntax_error_rate"] = mbpp["syntax_error_rate"]
         if lcb_eval:
+            exec_frac = fraction_executable_assert_tasks(lcb_eval)
+            if exec_frac < 0.5 and not dry_run:
+                raise SystemExit(
+                    f"[error] LiveCodeBench tasks have executable assert coverage "
+                    f"{exec_frac:.0%} (<50%). JSON stdin blobs are not runnable by "
+                    "code_executor — lcb_easy_pass1 would be a fake near-zero metric. "
+                    "Convert public tests to assert strings in data/lcb_easy.jsonl, "
+                    "or omit LCB until a proper harness exists."
+                )
             lcb_outs = generate_for_model(
                 model_tag, model_path, base_model_path, lcb_eval, dry_run=dry_run
             )
             lcb = evaluate_benchmark(lcb_eval, lcb_outs)
             result["lcb_easy_pass1"] = lcb["pass_at_1"]
+            result["lcb_executable_assert_frac"] = exec_frac
         else:
             result["lcb_easy_pass1"] = None
 

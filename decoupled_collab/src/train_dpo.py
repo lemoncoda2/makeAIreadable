@@ -133,19 +133,33 @@ def build_dpo_config(cfg: Dict[str, Any], output_dir: Path, report_to: str):
     if DPOConfig is None:
         return kwargs
 
-    try:
-        return DPOConfig(**kwargs)
-    except TypeError:
-        # Drop keys not accepted by this version
-        import dataclasses
-        import inspect
+    import dataclasses
+    import inspect
 
-        if dataclasses.is_dataclass(DPOConfig):
-            fields = {f.name for f in dataclasses.fields(DPOConfig)}
-        else:
-            fields = set(inspect.signature(DPOConfig.__init__).parameters) - {"self"}
-        filtered = {k: v for k, v in kwargs.items() if k in fields}
+    if dataclasses.is_dataclass(DPOConfig):
+        fields = {f.name for f in dataclasses.fields(DPOConfig)}
+    else:
+        fields = set(inspect.signature(DPOConfig.__init__).parameters) - {"self"}
+    filtered = {k: v for k, v in kwargs.items() if k in fields}
+    dropped = sorted(set(kwargs) - set(filtered))
+    # Core DPO knobs must not disappear silently (fake-success risk).
+    required_keep = ("beta", "learning_rate", "per_device_train_batch_size", "fp16")
+    missing_required = [k for k in required_keep if k in kwargs and k not in filtered]
+    if missing_required:
+        raise TypeError(
+            "DPOConfig introspection dropped required keys "
+            f"{missing_required}. Align trl version (expected ~0.15) or fix mapping. "
+            f"Dropped: {dropped}"
+        )
+    if dropped:
+        print(f"[info] DPOConfig ignored unsupported keys for this trl: {dropped}")
+    try:
         return DPOConfig(**filtered)
+    except TypeError as e:
+        raise TypeError(
+            "Failed to construct trl.DPOConfig — refusing silent kwargs surgery. "
+            f"Tried keys: {sorted(filtered)}. Underlying error: {e}"
+        ) from e
 
 
 def print_plan(cfg: Dict[str, Any], args: argparse.Namespace, paths: Dict[str, Path]):
@@ -164,13 +178,6 @@ def print_plan(cfg: Dict[str, Any], args: argparse.Namespace, paths: Dict[str, P
     print(f"  reference_free: {cfg.get('dpo', {}).get('reference_free')}")
     print(f"  dry_run      : {args.dry_run}")
     print("=" * 60)
-
-
-def _freeze_model(model):
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
-    return model
 
 
 def main() -> int:
@@ -282,42 +289,34 @@ def main() -> int:
     print(f"[info] Loading policy base from {base_model} (dtype={dtype})")
     policy = load_causal_lm(base_model, torch_dtype=dtype)
 
-    if resume_from.exists() and (
+    has_adapter = resume_from.exists() and (
         (resume_from / "adapter_config.json").exists()
         or (resume_from / "adapter_model.safetensors").exists()
         or (resume_from / "adapter_model.bin").exists()
-    ):
-        print(f"[info] Resuming LoRA from RL checkpoint: {resume_from}")
-        policy = maybe_merge_or_load_peft(policy, resume_from, is_trainable=True)
-        peft_config = None
-    else:
+    )
+    if not has_adapter:
         print(
-            f"[warn] No LoRA adapter at {resume_from}; "
-            "initializing fresh LoRA on base model."
+            f"[error] DPO expects a trained RL LoRA adapter at {resume_from} "
+            "(adapter_config.json). Refusing to silently start a fresh LoRA on base — "
+            "that would not be Model_RL→DPO. Finish GRPO first or pass --model "
+            "pointing at the RL adapter directory."
         )
-        peft_config = build_lora_config(
-            rank=int(lora_cfg.get("rank", 32)),
-            alpha=int(lora_cfg.get("alpha", 64)),
-            target_modules=lora_cfg.get("target_modules"),
-            dropout=float(lora_cfg.get("dropout", 0.05)),
-        )
+        return 1
+
+    print(f"[info] Resuming LoRA from RL checkpoint: {resume_from}")
+    policy = maybe_merge_or_load_peft(policy, resume_from, is_trainable=True)
+    peft_config = None
 
     ref_model = None
     if not reference_free:
-        # Reference = Model_RL (frozen). Load a separate copy with the same adapter.
-        print(f"[info] Loading reference model (Model_RL) from {resume_from}")
-        ref_base = load_causal_lm(base_model, torch_dtype=dtype)
-        if resume_from.exists() and (resume_from / "adapter_config.json").exists():
-            ref_model = maybe_merge_or_load_peft(
-                ref_base, resume_from, is_trainable=False
-            )
-        else:
-            # If resume path is a full merged checkpoint directory, load it directly
-            try:
-                ref_model = load_causal_lm(resume_from, torch_dtype=dtype)
-            except Exception:
-                ref_model = ref_base
-        ref_model = _freeze_model(ref_model)
+        # PEFT path: pass ref_model=None so TRL uses the policy with adapters
+        # disabled as the reference. A second full Qwen3-4B copy per DDP rank
+        # OOMs easily on 32GB V100 (2×fp16 weights + grads/acts).
+        print(
+            "[info] Using PEFT implicit reference (ref_model=None): TRL disables "
+            "adapters on the policy for Model_RL-as-reference. "
+            "Set dpo.reference_free=true only if you intentionally skip KL to ref."
+        )
     else:
         print("[info] reference_free=true → no explicit reference model")
 

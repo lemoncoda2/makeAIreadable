@@ -25,6 +25,8 @@ __all__ = [
 SCORE_KEYS = ("clarity", "conciseness", "informativeness", "naturalness", "overall")
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
+# GOAL meta mentions deepseek-v4-flash; set DEEPSEEK_MODEL to match your gateway.
+# Default stays deepseek-chat (public DeepSeek API id) — we log the resolved id.
 DEFAULT_MODEL = "deepseek-chat"
 
 
@@ -62,7 +64,13 @@ def get_deepseek_async_client(
 
 
 def _model_name() -> str:
-    return os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL)
+    name = os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL)
+    if "DEEPSEEK_MODEL" not in os.environ:
+        print(
+            f"[info] DEEPSEEK_MODEL unset; using {name!r}. "
+            "GOAL suggests deepseek-v4-flash — export DEEPSEEK_MODEL if your endpoint uses that id."
+        )
+    return name
 
 
 def parse_json_score(text: str) -> Dict[str, float]:

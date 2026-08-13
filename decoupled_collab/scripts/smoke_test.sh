@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Offline smoke test: pytest + dry_run pipeline phases (no GPU required)
+# Offline smoke test: pytest + dry_run pipeline phases (no GPU required).
+# Writes ONLY under data/smoke/ — never clobbers real benchmark jsonl.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,13 +13,16 @@ fi
 
 export PYTHONPATH="${ROOT}/src:${PYTHONPATH:-}"
 
-echo "==> Writing tiny SYNTHETIC fixtures (smoke/dry_run only; real runs refuse these)"
+SMOKE_DIR=./data/smoke
+mkdir -p "$SMOKE_DIR" ./data/traces ./data/dpo_pairs ./results
+
+echo "==> Writing tiny SYNTHETIC fixtures under $SMOKE_DIR (never touches data/mbpp_*.jsonl)"
 "$PYTHON" - <<'PY'
 import json
 from pathlib import Path
 
-root = Path(".")
-(root / "data").mkdir(parents=True, exist_ok=True)
+smoke = Path("data/smoke")
+smoke.mkdir(parents=True, exist_ok=True)
 train = [
     {
         "task_id": "mbpp_1",
@@ -63,16 +67,16 @@ lcb = [
         "difficulty": "easy",
     }
 ]
-with open("data/mbpp_train.jsonl", "w") as f:
+with open(smoke / "mbpp_train.jsonl", "w") as f:
     for t in train:
         f.write(json.dumps(t) + "\n")
-with open("data/mbpp_plus_test.jsonl", "w") as f:
+with open(smoke / "mbpp_plus_test.jsonl", "w") as f:
     for t in eval_tasks:
         f.write(json.dumps(t) + "\n")
-with open("data/lcb_easy.jsonl", "w") as f:
+with open(smoke / "lcb_easy.jsonl", "w") as f:
     for t in lcb:
         f.write(json.dumps(t) + "\n")
-print("synthetic fixtures ok (NOT for real training)")
+print("synthetic fixtures ok under data/smoke/ (NOT for real training)")
 PY
 
 echo "==> pytest"
@@ -81,11 +85,11 @@ echo "==> pytest"
 # Fresh smoke outputs
 rm -f ./data/traces/smoke_traces.jsonl ./data/dpo_pairs/smoke_raw.jsonl ./data/dpo_pairs/smoke_filtered.jsonl
 
-echo "==> dry_run collect → regen → filter → evaluate"
+echo "==> dry_run collect → regen → filter → evaluate (smoke paths only)"
 "$PYTHON" src/collect_traces.py \
   --model ./models/Qwen3-4B \
   --base_model_path ./models/Qwen3-4B \
-  --tasks ./data/mbpp_train.jsonl \
+  --tasks ./data/smoke/mbpp_train.jsonl \
   --output ./data/traces/smoke_traces.jsonl \
   --num_tasks 2 \
   --dry_run \
@@ -103,7 +107,8 @@ echo "==> dry_run collect → regen → filter → evaluate"
   --raw_pairs ./data/dpo_pairs/smoke_raw.jsonl \
   --output ./data/dpo_pairs/smoke_filtered.jsonl \
   --mock_judge \
-  --threshold 6.0
+  --threshold 6.0 \
+  --min_pairs 1
 
 "$PYTHON" src/evaluate.py \
   --mode full \
@@ -111,8 +116,8 @@ echo "==> dry_run collect → regen → filter → evaluate"
   --base_model ./models/Qwen3-4B \
   --rl_model ./checkpoints/cycle_0/model_rl \
   --final_model ./checkpoints/cycle_0/model_rl_dpo \
-  --eval_data ./data/mbpp_plus_test.jsonl \
-  --lcb_data ./data/lcb_easy.jsonl \
+  --eval_data ./data/smoke/mbpp_plus_test.jsonl \
+  --lcb_data ./data/smoke/lcb_easy.jsonl \
   --num_tasks_benchmark 1 \
   --num_tasks_readability 1 \
   --dry_run \
@@ -145,4 +150,4 @@ echo "==> dry_run pipeline single phases"
   --dry_run \
   --only_phase phase3_filter
 
-echo "✓ smoke_test.sh finished"
+echo "✓ smoke_test.sh finished (real data/mbpp_*.jsonl untouched)"

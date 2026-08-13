@@ -92,10 +92,12 @@ async def filter_async(
     model: Optional[str],
     max_retries: int,
     batch_size: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
+    """Return (kept_records, score_error_count)."""
     client = get_deepseek_async_client()
     sem = asyncio.Semaphore(max_concurrent)
     kept: list[dict[str, Any]] = []
+    score_errors = 0
 
     try:
         for start in range(0, len(pairs), batch_size):
@@ -111,6 +113,7 @@ async def filter_async(
             )
             for pair, result in zip(batch, results):
                 if isinstance(result, Exception):
+                    score_errors += 1
                     print(f"[warn] scoring failed for {pair.get('task_id')}: {result}")
                     continue
                 regen_score, rl_score = result
@@ -118,7 +121,7 @@ async def filter_async(
                     kept.append(to_dpo_record(pair, regen_score, rl_score))
             print(
                 f"Processed {min(start + batch_size, len(pairs))}/{len(pairs)}; "
-                f"kept {len(kept)}"
+                f"kept {len(kept)}; score_errors={score_errors}"
             )
     finally:
         close = getattr(client, "close", None)
@@ -127,7 +130,7 @@ async def filter_async(
             if asyncio.iscoroutine(result):
                 await result
 
-    return kept
+    return kept, score_errors
 
 
 def filter_mock(pairs: list[dict[str, Any]], *, threshold: float) -> list[dict[str, Any]]:
@@ -158,6 +161,18 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="Offline: synthetic scores so regen > rl when texts differ",
     )
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--min_pairs",
+        type=int,
+        default=1,
+        help="Fail if fewer pairs kept (GOAL real runs use ~1500 via pipeline)",
+    )
+    parser.add_argument(
+        "--max_score_error_rate",
+        type=float,
+        default=0.25,
+        help="Fail if scoring exceptions exceed this fraction of pairs (non-mock)",
+    )
     args = parser.parse_args(argv)
 
     pairs = load_jsonl(args.raw_pairs)
@@ -166,10 +181,11 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     print(f"Loaded {len(pairs)} raw pairs from {args.raw_pairs}")
 
+    score_errors = 0
     if args.mock_judge or args.judge_api == "mock":
         kept = filter_mock(pairs, threshold=args.threshold)
     else:
-        kept = asyncio.run(
+        kept, score_errors = asyncio.run(
             filter_async(
                 pairs,
                 threshold=args.threshold,
@@ -179,6 +195,15 @@ def main(argv: Optional[list[str]] = None) -> None:
                 batch_size=args.batch_size,
             )
         )
+        if pairs:
+            err_rate = score_errors / len(pairs)
+            if err_rate > args.max_score_error_rate:
+                raise SystemExit(
+                    f"[error] Judge scoring error rate {err_rate:.2%} "
+                    f"({score_errors}/{len(pairs)}) exceeds "
+                    f"--max_score_error_rate={args.max_score_error_rate}. "
+                    "Fix API/model before training on a thin filtered set."
+                )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
@@ -186,6 +211,11 @@ def main(argv: Optional[list[str]] = None) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     print(f"Kept {len(kept)}/{len(pairs)} pairs → {args.output}")
+    if len(kept) < args.min_pairs:
+        raise SystemExit(
+            f"[error] Kept only {len(kept)} pairs < --min_pairs={args.min_pairs}. "
+            "Refusing empty/thin DPO data (looks like success but trains on almost nothing)."
+        )
 
 
 if __name__ == "__main__":

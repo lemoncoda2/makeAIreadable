@@ -22,8 +22,9 @@ dpo:
 training:
   learning_rate: 5.0e-6
   num_epochs: 3
-  per_device_batch_size: 2
-  gradient_accumulation_steps: 4
+  # batch 2 + full ref copy OOMs on V100; PEFT implicit ref + batch 1 is safer.
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 8
   max_length: 1536
   max_prompt_length: 1024
   warmup_ratio: 0.1

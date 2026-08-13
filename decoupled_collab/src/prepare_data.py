@@ -331,14 +331,34 @@ def prepare_lcb_easy(output: Path, *, download: bool = False) -> list[dict[str, 
                         raw_tests = json.loads(raw_tests)
                     except json.JSONDecodeError:
                         raw_tests = [raw_tests]
-                # Normalize to list[str] asserts / call specs as strings
+                # Prefer assert-style strings; JSON dumps are NOT executable by
+                # code_executor (evaluate refuses LCB if coverage is too low).
                 test_cases: list[str] = []
                 for tc in raw_tests:
                     if isinstance(tc, str):
-                        test_cases.append(tc)
+                        s = tc.strip()
+                        if s.startswith("assert") or s.startswith("assert("):
+                            test_cases.append(s)
+                        else:
+                            # Keep raw string only if it looks like an assert later;
+                            # skip opaque payloads that would fake a prepared dataset.
+                            try:
+                                parsed = json.loads(s)
+                            except json.JSONDecodeError:
+                                test_cases.append(s)
+                                continue
+                            if isinstance(parsed, dict) and (
+                                "assert" in parsed or "code" in parsed
+                            ):
+                                test_cases.append(s)
+                            # else: drop stdin JSON blobs (not runnable here)
+                    elif isinstance(tc, dict):
+                        # Functional: {"input": ..., "output": ...} needs a harness —
+                        # do not store json.dumps as a fake "test".
+                        continue
                     else:
-                        test_cases.append(json.dumps(tc))
-                if not prompt:
+                        continue
+                if not prompt or not test_cases:
                     continue
                 tasks.append(
                     {
