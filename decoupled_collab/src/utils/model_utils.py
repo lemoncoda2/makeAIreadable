@@ -179,28 +179,20 @@ def apply_chat_template_with_thinking(
     **kwargs,
 ):
     """
-    Apply chat template with Qwen3 thinking mode when supported.
+    Apply chat template with Qwen3 thinking mode.
 
-    Tries `enable_thinking=...`, then `thinking=...`, then plain apply_chat_template.
+    Fail-fast: never silently drop enable_thinking (that would break work/collab separation).
     """
-    base_kwargs = dict(
-        tokenize=tokenize,
+    from utils.failfast import apply_chat_template_thinking_strict
+
+    return apply_chat_template_thinking_strict(
+        tokenizer,
+        messages,
+        enable_thinking=enable_thinking,
         add_generation_prompt=add_generation_prompt,
+        tokenize=tokenize,
         **kwargs,
     )
-    try:
-        return tokenizer.apply_chat_template(
-            messages, enable_thinking=enable_thinking, **base_kwargs
-        )
-    except TypeError:
-        pass
-    try:
-        return tokenizer.apply_chat_template(
-            messages, thinking=enable_thinking, **base_kwargs
-        )
-    except TypeError:
-        pass
-    return tokenizer.apply_chat_template(messages, **base_kwargs)
 
 
 def maybe_merge_or_load_peft(
@@ -254,8 +246,9 @@ def find_base_model_path(
     """
     Resolve the underlying base model directory.
 
-    If `name_or_path` looks like a LoRA/checkpoint dir (has adapter_config.json),
-    fall back to `default_base` (or adapter_config's base_model_name_or_path).
+    If `name_or_path` is a LoRA dir (adapter_config.json), use its
+    base_model_name_or_path (required) or explicit default_base if that field is set.
+    Never invent a path that does not exist.
     """
     path = Path(name_or_path)
     if root is not None and not path.is_absolute():
@@ -267,28 +260,48 @@ def find_base_model_path(
 
         with adapter_cfg.open("r", encoding="utf-8") as f:
             cfg = json.load(f)
-        base = cfg.get("base_model_name_or_path") or default_base
+        base = cfg.get("base_model_name_or_path")
+        if not base:
+            base = default_base
+            print(
+                f"[info] adapter_config.json at {adapter_cfg} has no "
+                f"base_model_name_or_path; using default_base={default_base!r}"
+            )
         base_path = Path(base)
         if root is not None and not base_path.is_absolute():
             base_path = resolve_path(base_path, root)
+        if not base_path.exists():
+            raise FileNotFoundError(
+                f"Base model for adapter {path} not found: {base_path}. "
+                "Download the base weights or fix adapter_config.json / --base_model."
+            )
         return base_path
 
     if path.exists():
         return path
 
-    default = Path(default_base)
-    if root is not None and not default.is_absolute():
-        default = resolve_path(default, root)
-    return default
+    raise FileNotFoundError(
+        f"Model path not found: {path}. "
+        f"(default_base={default_base!r} is not used as a silent substitute when "
+        "the requested path is missing.)"
+    )
 
 
-def setup_wandb_env(logging_cfg: Optional[Dict[str, Any]]) -> Optional[str]:
+def setup_wandb_env(
+    logging_cfg: Optional[Dict[str, Any]],
+    *,
+    dry_run: bool = False,
+) -> Optional[str]:
     """
     Configure wandb report_to based on env / config.
 
     Returns report_to string: "wandb" or "none".
+    Fail-fast if wandb is requested without credentials (non-dry-run).
     """
+    from utils.failfast import validate_wandb_if_enabled
+
     logging_cfg = logging_cfg or {}
+    validate_wandb_if_enabled(logging_cfg, dry_run=dry_run)
     project = os.environ.get("WANDB_PROJECT") or logging_cfg.get("wandb_project")
     run_name = logging_cfg.get("wandb_run")
     if project:
@@ -302,29 +315,22 @@ def setup_wandb_env(logging_cfg: Optional[Dict[str, Any]]) -> Optional[str]:
 def check_cuda_or_warn(dry_run: bool = False) -> bool:
     """
     Return True if CUDA is available.
-    Print a graceful message when unavailable; allow dry_run without failing hard.
-    """
-    try:
-        import torch
-    except ImportError:
-        print("[warn] PyTorch is not installed.")
-        if dry_run:
-            print("        Continuing dry-run without training.")
-            return False
-        print("        Use --dry_run to load config and print the plan without training.")
-        return False
 
-    available = torch.cuda.is_available()
-    if available:
-        print(f"[info] CUDA available: {torch.cuda.device_count()} device(s)")
-        return True
-    msg = (
-        "[warn] CUDA is not available. Training requires GPU(s) "
-        "(target hardware: 4×V100-32G)."
-    )
+    Non-dry-run: raises RuntimeError (fail-fast) instead of soft-warning.
+    Dry-run: returns False without raising.
+    """
+    from utils.failfast import require_cuda
+
     if dry_run:
-        print(msg + " Continuing dry-run without training.")
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                print(f"[info] CUDA available: {torch.cuda.device_count()} device(s)")
+                return True
+        except ImportError:
+            pass
+        print("[info] dry_run: CUDA not required; skipping GPU check.")
         return False
-    print(msg)
-    print("        Use --dry_run to load config and print the plan without training.")
-    return False
+    require_cuda(dry_run=False)
+    return True

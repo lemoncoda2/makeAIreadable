@@ -7,6 +7,10 @@ to separate the work layer (`<think>` + code) from the collaboration layer.
 Hardware target: **4× V100-32G** SSH server. GPU training runs on that remote machine;
 local/cloud agents can use `--dry_run` / `--mock_judge` for offline pipeline checks.
 
+**Fail-fast:** scripts refuse silent fallbacks (thinking mode, missing reward `test_cases`,
+dry-run placeholder checkpoints, vLLM+LoRA adapter dirs, unparseable judge JSON, GRPO
+batch/generations mismatch). Prefer a loud error over a fake success.
+
 ## Layout
 
 ```

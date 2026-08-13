@@ -92,61 +92,62 @@ def dry_run_generation(task: dict[str, Any], model_tag: str) -> str:
 
 class ModelRunner:
     def __init__(self, model_path: str, base_model_path: Optional[str] = None):
-        try:
-            from utils.model_utils import (
-                apply_chat_template_with_thinking,
-                load_causal_lm,
-                load_tokenizer,
-                maybe_merge_or_load_peft,
-            )
+        from utils.failfast import (
+            assert_not_dry_run_placeholder,
+            model_input_device,
+            require_cuda,
+            require_thinking_support,
+        )
+        from utils.model_utils import (
+            apply_chat_template_with_thinking,
+            load_causal_lm,
+            load_tokenizer,
+            maybe_merge_or_load_peft,
+        )
 
-            tok_src = base_model_path or model_path
-            self.tokenizer = load_tokenizer(tok_src)
-            base = load_causal_lm(tok_src)
-            self.model = maybe_merge_or_load_peft(base, model_path, tok_src)
-            self._apply = apply_chat_template_with_thinking
-        except Exception:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            from peft import PeftModel
+        if not model_path:
+            raise ValueError("model_path is required for ModelRunner (got empty/None)")
 
+        assert_not_dry_run_placeholder(model_path, what="eval model")
+        require_cuda(dry_run=False)
+
+        adapter_cfg = Path(model_path) / "adapter_config.json"
+        if adapter_cfg.exists():
+            if not base_model_path:
+                raise ValueError(
+                    f"{model_path} looks like a PEFT adapter (adapter_config.json) "
+                    "but --base_model was not provided. Pass the base model path "
+                    "explicitly; refusing to guess."
+                )
+            tok_src = base_model_path
+        else:
             tok_src = base_model_path or model_path
-            self.tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
-            base = AutoModelForCausalLM.from_pretrained(
-                tok_src,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                trust_remote_code=True,
+
+        self.tokenizer = load_tokenizer(tok_src)
+        require_thinking_support(self.tokenizer, enable_thinking=True)
+        base = load_causal_lm(tok_src, torch_dtype="float16", device_map="auto")
+        if adapter_cfg.exists():
+            self.model = maybe_merge_or_load_peft(
+                base, model_path, is_trainable=False
             )
-            adapter_cfg = Path(model_path) / "adapter_config.json"
-            if adapter_cfg.exists():
-                self.model = PeftModel.from_pretrained(base, model_path)
-            else:
-                self.model = base
-            self.model.eval()
-            self._apply = None
+        else:
+            if base_model_path and Path(model_path).resolve() != Path(tok_src).resolve():
+                raise ValueError(
+                    f"model_path={model_path} is not a PEFT adapter and differs from "
+                    f"base={tok_src}. Refusing ambiguous load."
+                )
+            self.model = base
+        self.model.eval()
+        self._apply = apply_chat_template_with_thinking
+        self._device = model_input_device(self.model)
 
     def generate(self, prompt: str, max_new_tokens: int = 768, temperature: float = 0.2) -> str:
         import torch
 
         messages = build_coding_messages(prompt)
-        if self._apply is not None:
-            text = self._apply(self.tokenizer, messages, enable_thinking=True)
-        else:
-            try:
-                text = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=True,
-                )
-            except TypeError:
-                text = self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+        text = self._apply(self.tokenizer, messages, enable_thinking=True)
         inputs = self.tokenizer(text, return_tensors="pt")
-        device = next(self.model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
         with torch.no_grad():
             out = self.model.generate(
                 **inputs,
@@ -260,7 +261,7 @@ def evaluate_model(
             model_tag, model_path, base_model_path, read_tasks, dry_run=dry_run
         )
         read = evaluate_readability(
-            read_tasks, outs, mock_judge=mock_judge or dry_run, model_tag=model_tag
+            read_tasks, outs, mock_judge=mock_judge, model_tag=model_tag
         )
         result["readability_overall"] = read["overall"]
         result["readability_detail"] = {
@@ -302,20 +303,36 @@ def main(argv: Optional[list[str]] = None) -> None:
         args.num_tasks_benchmark = args.num_tasks
         args.num_tasks_readability = min(args.num_tasks, args.num_tasks_readability)
 
-    mock_judge = args.mock_judge or args.judge_api == "mock" or args.dry_run
+    # mock_judge only when explicitly requested — dry_run alone must not imply
+    # fake readability scores unless --mock_judge / --judge_api mock is set.
+    mock_judge = bool(args.mock_judge or args.judge_api == "mock")
+    if args.dry_run and not mock_judge and args.mode in ("full", "hypothesis_check", "readability"):
+        raise SystemExit(
+            "[error] --dry_run evaluation of readability still needs an explicit "
+            "--mock_judge (or --judge_api mock). Refusing to silently fabricate "
+            "judge scores."
+        )
 
     mbpp_tasks = load_jsonl(args.eval_data)
     lcb_tasks = load_jsonl(args.lcb_data)
-    if not mbpp_tasks and args.dry_run:
-        mbpp_tasks = [
-            {
-                "task_id": f"mbpp_smoke_{i}",
-                "prompt": f"Write a function that returns {i}.",
-                "test_cases": [f"assert solution() == {i}"],
-                "code_solution": f"def solution():\n    return {i}\n",
-            }
-            for i in range(5)
-        ]
+    if not mbpp_tasks:
+        if args.dry_run:
+            raise SystemExit(
+                f"[error] eval_data is empty/missing: {args.eval_data}. "
+                "dry_run will not invent MBPP tasks — provide a real jsonl "
+                "(or the example fixtures) so results stay interpretable."
+            )
+        raise SystemExit(
+            f"[error] eval_data is empty/missing: {args.eval_data}. "
+            "Run prepare_data / download_assets first."
+        )
+    if args.mode == "full" and args.lcb_data and not lcb_tasks and not args.dry_run:
+        raise SystemExit(
+            f"[error] LiveCodeBench file is empty/missing: {args.lcb_data}. "
+            "GOAL requires LCB-easy for contamination-free checks. Populate the "
+            "file or omit --lcb_data / use a mode that does not require it. "
+            "Refusing to report lcb_easy_pass1=null as if evaluation succeeded."
+        )
 
     tags = [t.strip() for t in args.models.split(",") if t.strip()]
     if args.mode == "hypothesis_check":

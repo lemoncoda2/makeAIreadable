@@ -96,11 +96,20 @@ class RegenGenerator:
         self.llm = None
         self.sampling_params = None
 
+        from utils.failfast import (
+            assert_not_adapter_for_vllm,
+            assert_not_dry_run_placeholder,
+            model_input_device,
+            require_cuda,
+        )
         from transformers import AutoTokenizer
 
+        assert_not_dry_run_placeholder(model_path, what="regen base_model")
+        require_cuda(dry_run=False)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
         if use_vllm:
+            assert_not_adapter_for_vllm(model_path)
             from vllm import LLM, SamplingParams
 
             self.llm = LLM(model=model_path, trust_remote_code=True)
@@ -120,6 +129,7 @@ class RegenGenerator:
                 trust_remote_code=True,
             )
             self.model.eval()
+            self._device = model_input_device(self.model)
 
     def generate(self, trace: dict[str, Any]) -> str:
         messages = messages_for_trace(trace)
@@ -133,7 +143,7 @@ class RegenGenerator:
         import torch
 
         inputs = self.tokenizer(text, return_tensors="pt")
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
         with torch.no_grad():
             out = self.model.generate(
                 **inputs,

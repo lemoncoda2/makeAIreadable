@@ -1,4 +1,5 @@
 # DPO training config (GOAL Step 3.4)
+# NOTE: pipeline CLI --model / --dpo_data / --output override these paths.
 model:
   name_or_path: ./checkpoints/cycle_0/model_rl
   torch_dtype: float16
@@ -8,7 +9,9 @@ output_dir: ./checkpoints/cycle_0/model_rl_dpo
 lora:
   rank: 32
   alpha: 64
-  resume_from: ./checkpoints/cycle_0/model_rl
+  # Prefer CLI --model. If set here, it is used only when --model is omitted.
+  # Do NOT hard-pin cycle_0 when running later cycles via the pipeline.
+  resume_from: null
 
 dpo:
   beta: 0.1
@@ -27,9 +30,10 @@ training:
   fp16: true
 
 data:
-  train_file: ./data/dpo_pairs/cycle_0_filtered_pairs.jsonl
+  # Matches run_pipeline.py output name (not *_pairs.jsonl).
+  train_file: ./data/dpo_pairs/cycle_0_filtered.jsonl
   eval_split: 0.05
 
 logging:
-  wandb_project: decoupled-collab
+  # wandb_project: decoupled-collab
   wandb_run: cycle0_dpo

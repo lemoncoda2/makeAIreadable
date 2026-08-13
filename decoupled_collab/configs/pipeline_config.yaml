@@ -9,6 +9,10 @@ grpo:
 dpo:
   config: configs/dpo_config.yaml
   threshold: 6.0
+inference:
+  # false: HuggingFace+PEFT (supports LoRA adapter dirs).
+  # true: vLLM — ONLY for full merged model dirs; adapter_config.json will fail-fast.
+  use_vllm: false
 eval:
   num_tasks_benchmark: 200
   num_tasks_readability: 50

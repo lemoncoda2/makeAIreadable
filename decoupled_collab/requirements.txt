@@ -5,6 +5,11 @@
 #
 # Then:
 #   pip install -r requirements.txt
+#
+# WARNING (fail-fast): GOAL pinned transformers==4.45.0 / vllm==0.6.4, but Qwen3
+# thinking mode typically needs newer transformers (>=4.51). Scripts will ERROR
+# if enable_thinking is unsupported — do NOT silence that. Align versions on the
+# V100 box before a real run; pins below are starting points, not a guarantee.
 
 transformers==4.45.0
 vllm==0.6.4
