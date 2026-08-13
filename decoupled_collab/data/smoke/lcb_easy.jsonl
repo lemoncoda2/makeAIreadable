@@ -1,1 +1,0 @@
-{"task_id": "lcb_smoke_1", "prompt": "Write a function that returns 1.", "test_cases": ["assert solution() == 1"], "code_solution": "def solution():\n    return 1\n", "source": "livecodebench_easy", "benchmark": "lcb_easy", "synthetic": true, "difficulty": "easy"}

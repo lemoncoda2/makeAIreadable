@@ -8,6 +8,8 @@ data/dpo_pairs/*.jsonl
 data/mbpp_train.jsonl
 data/mbpp_plus_test.jsonl
 data/lcb_easy.jsonl
+data/smoke/**
+!data/smoke/.gitkeep
 !data/*.example.jsonl
 data/raw/**
 !data/raw/.gitkeep
