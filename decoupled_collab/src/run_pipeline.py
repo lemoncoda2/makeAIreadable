@@ -190,6 +190,9 @@ def run_phase(
     n_bench = int(eval_cfg.get("num_tasks_benchmark", 200))
     n_read = int(eval_cfg.get("num_tasks_readability", 50))
     base_model = str(resolve_path(project_root, config["general"]["base_model"]))
+    use_vllm = bool(config.get("inference", {}).get("use_vllm", False))
+    if dry_run:
+        use_vllm = False
 
     py = _py()
     dry = _flag(dry_run)
@@ -200,15 +203,22 @@ def run_phase(
         if dry_run:
             out.mkdir(parents=True, exist_ok=True)
             (out / "DRY_RUN_PLACEHOLDER").write_text(
-                f"dry_run grpo from {model}\n", encoding="utf-8"
+                f"dry_run grpo from {model}\n"
+                "THIS IS NOT A TRAINED MODEL. Real runs refuse to load this directory.\n",
+                encoding="utf-8",
             )
-            print(f"[dry_run] Skipped GRPO training; placeholder at {out}")
+            print(
+                f"[dry_run] Skipped GRPO training; wrote explicit placeholder at {out}. "
+                "Do not resume a real run from this directory."
+            )
             return
         train_script = project_root / "src" / "train_grpo.py"
         if not train_script.exists():
             raise FileNotFoundError(
                 f"Missing {train_script}. Implement GRPO training before running without --dry_run."
             )
+        # Export so train_grpo fail-fast divisibility check sees the real world size.
+        os.environ["ACCELERATE_NUM_PROCESSES"] = str(num_gpus)
         run_cmd(
             f"accelerate launch --num_processes {num_gpus} {shlex.quote(str(train_script))} "
             f"--config {shlex.quote(str(grpo_cfg))} "
@@ -218,30 +228,42 @@ def run_phase(
         )
 
     elif phase == "phase1_eval":
+        rl_path = cycle_dir / "model_rl"
+        if not dry_run:
+            from utils.failfast import assert_not_dry_run_placeholder
+
+            assert_not_dry_run_placeholder(rl_path, what="phase1_eval rl_model")
         out = cycle_dir / "phase1_check.json"
+        mock = " --mock_judge" if dry_run else ""
+        if dry_run and not mock.strip():
+            raise RuntimeError("internal: dry_run eval must pass --mock_judge explicitly")
         run_cmd(
             f"{py} src/evaluate.py --mode hypothesis_check "
             f"--base_model {shlex.quote(base_model)} "
-            f"--rl_model {shlex.quote(str(cycle_dir / 'model_rl'))} "
+            f"--rl_model {shlex.quote(str(rl_path))} "
             f"--eval_data {shlex.quote(str(mbpp_plus))} "
             f"--num_tasks_benchmark {n_bench} --num_tasks_readability {n_read} "
-            f"--output {shlex.quote(str(out))}{dry}"
-            + (" --mock_judge" if dry_run else ""),
+            f"--output {shlex.quote(str(out))}{dry}{mock}",
             log_dir / "phase1_eval.log",
             cwd=project_root,
         )
 
     elif phase == "phase2_collect":
+        rl_path = cycle_dir / "model_rl"
+        if not dry_run:
+            from utils.failfast import assert_not_dry_run_placeholder
+
+            assert_not_dry_run_placeholder(rl_path, what="phase2_collect model")
         out = resolve_path(project_root, f"./data/traces/cycle_{cycle}_traces.jsonl")
         train_tasks = resolve_path(project_root, "./data/mbpp_train.jsonl")
         run_cmd(
             f"{py} src/collect_traces.py "
-            f"--model {shlex.quote(str(cycle_dir / 'model_rl'))} "
+            f"--model {shlex.quote(str(rl_path))} "
             f"--base_model_path {shlex.quote(base_model)} "
             f"--tasks {shlex.quote(str(train_tasks))} "
             f"--output {shlex.quote(str(out))} "
             f"--num_tasks {num_collect} "
-            f"--use_vllm {'false' if dry_run else 'true'}"
+            f"--use_vllm {'true' if use_vllm else 'false'}"
             f"{dry}",
             log_dir / "collect.log",
             cwd=project_root,
@@ -255,7 +277,7 @@ def run_phase(
             f"--base_model {shlex.quote(base_model)} "
             f"--traces {shlex.quote(str(traces))} "
             f"--output {shlex.quote(str(out))} "
-            f"--use_vllm {'false' if dry_run else 'true'}"
+            f"--use_vllm {'true' if use_vllm else 'false'}"
             f"{dry}",
             log_dir / "regen.log",
             cwd=project_root,
@@ -281,10 +303,17 @@ def run_phase(
         if dry_run:
             out.mkdir(parents=True, exist_ok=True)
             (out / "DRY_RUN_PLACEHOLDER").write_text(
-                f"dry_run dpo from {model}\n", encoding="utf-8"
+                f"dry_run dpo from {model}\n"
+                "THIS IS NOT A TRAINED MODEL. Real runs refuse to load this directory.\n",
+                encoding="utf-8",
             )
-            print(f"[dry_run] Skipped DPO training; placeholder at {out}")
+            print(
+                f"[dry_run] Skipped DPO training; wrote explicit placeholder at {out}."
+            )
             return
+        from utils.failfast import assert_not_dry_run_placeholder
+
+        assert_not_dry_run_placeholder(model, what="phase3_dpo --model")
         train_script = project_root / "src" / "train_dpo.py"
         if not train_script.exists():
             raise FileNotFoundError(
@@ -300,7 +329,17 @@ def run_phase(
         )
 
     elif phase == "phase4_eval":
+        if not dry_run:
+            from utils.failfast import assert_not_dry_run_placeholder
+
+            assert_not_dry_run_placeholder(
+                cycle_dir / "model_rl", what="phase4_eval rl_model"
+            )
+            assert_not_dry_run_placeholder(
+                cycle_dir / "model_rl_dpo", what="phase4_eval final_model"
+            )
         out = resolve_path(project_root, f"./results/cycle_{cycle}_eval.json")
+        mock = " --mock_judge" if dry_run else ""
         run_cmd(
             f"{py} src/evaluate.py --mode full "
             f"--models base,rl,final "
@@ -311,8 +350,7 @@ def run_phase(
             f"--lcb_data {shlex.quote(str(lcb_easy))} "
             f"--num_tasks_benchmark {n_bench} --num_tasks_readability {n_read} "
             f"--cycle {cycle} "
-            f"--output {shlex.quote(str(out))}{dry}"
-            + (" --mock_judge" if dry_run else ""),
+            f"--output {shlex.quote(str(out))}{dry}{mock}",
             log_dir / "eval.log",
             cwd=project_root,
         )

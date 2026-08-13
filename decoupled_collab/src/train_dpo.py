@@ -186,6 +186,8 @@ def main() -> int:
 
     if args.model:
         cfg.setdefault("model", {})["name_or_path"] = args.model
+        # CLI --model must win over yaml lora.resume_from (multi-cycle correctness).
+        cfg.setdefault("lora", {})["resume_from"] = args.model
     if args.output:
         cfg["output_dir"] = args.output
     if args.dpo_data:
@@ -197,7 +199,7 @@ def main() -> int:
     )
     dpo_data = resolve_path(
         cfg.get("data", {}).get(
-            "train_file", "./data/dpo_pairs/cycle_0_filtered_pairs.jsonl"
+            "train_file", "./data/dpo_pairs/cycle_0_filtered.jsonl"
         ),
         ROOT,
     )
@@ -205,14 +207,21 @@ def main() -> int:
     lora_cfg = cfg.get("lora", {})
     resume_from_raw = lora_cfg.get("resume_from") or str(model_path)
     resume_from = resolve_path(resume_from_raw, ROOT)
-    base_model = find_base_model_path(
-        model_path, default_base="./models/Qwen3-4B", root=ROOT
-    )
-    # If resume_from points at adapter, prefer its declared base
-    if (resume_from / "adapter_config.json").exists():
+    try:
         base_model = find_base_model_path(
-            resume_from, default_base=base_model, root=ROOT
+            model_path, default_base="./models/Qwen3-4B", root=ROOT
         )
+        if (resume_from / "adapter_config.json").exists():
+            base_model = find_base_model_path(
+                resume_from, default_base=base_model, root=ROOT
+            )
+    except FileNotFoundError as e:
+        if args.dry_run:
+            base_model = resolve_path("./models/Qwen3-4B", ROOT)
+            print(f"[dry_run] {e} — using {base_model} in plan only.")
+        else:
+            print(f"[error] {e}")
+            return 1
 
     paths = {
         "config": config_path,
@@ -228,9 +237,16 @@ def main() -> int:
         print("[dry_run] Exiting before model load / training.")
         return 0
 
-    cuda_ok = check_cuda_or_warn(dry_run=False)
-    if not cuda_ok:
+    from utils.failfast import assert_not_dry_run_placeholder
+
+    try:
+        check_cuda_or_warn(dry_run=False)
+    except RuntimeError as e:
+        print(f"[error] {e}")
         return 2
+
+    assert_not_dry_run_placeholder(resume_from, what="DPO resume adapter")
+    assert_not_dry_run_placeholder(model_path, what="DPO model path")
 
     try:
         from trl import DPOTrainer
@@ -239,10 +255,17 @@ def main() -> int:
         return 1
 
     if not dpo_data.exists():
-        print(f"[error] DPO data not found: {dpo_data}")
+        print(
+            f"[error] DPO data not found: {dpo_data}. "
+            "Pipeline writes cycle_N_filtered.jsonl; yaml default must match."
+        )
         return 1
 
-    report_to = setup_wandb_env(cfg.get("logging"))
+    try:
+        report_to = setup_wandb_env(cfg.get("logging"), dry_run=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[error] {e}")
+        return 1
     dtype = cfg.get("model", {}).get("torch_dtype", "float16")
     reference_free = bool(cfg.get("dpo", {}).get("reference_free", False))
 

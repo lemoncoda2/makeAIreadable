@@ -66,15 +66,16 @@ def _model_name() -> str:
 
 
 def parse_json_score(text: str) -> Dict[str, float]:
-    """Robustly extract a readability score JSON object from model text.
+    """Extract readability score JSON from judge output.
 
-    Handles fenced code blocks, surrounding prose, and trailing commas.
-    Missing keys default to ``0.0``. If ``overall`` is missing, averages the
-    four detail scores when any are present.
+    Fail-fast: refuses to invent 0.0 scores when the payload is empty/unparseable
+    or required keys are missing — silent zeros look like real low ratings.
     """
-    empty = {k: 0.0 for k in SCORE_KEYS}
     if not text or not str(text).strip():
-        return empty
+        raise ValueError(
+            "Judge returned empty content; cannot parse readability scores. "
+            "Refusing to default to zeros."
+        )
 
     raw = str(text).strip()
 
@@ -88,7 +89,6 @@ def parse_json_score(text: str) -> Dict[str, float]:
     # Extract outermost {...} spans
     brace_matches = list(re.finditer(r"\{[^{}]*\}", raw, re.DOTALL))
     if not brace_matches:
-        # Nested braces: find first { to last }
         start = raw.find("{")
         end = raw.rfind("}")
         if start != -1 and end > start:
@@ -98,19 +98,20 @@ def parse_json_score(text: str) -> Dict[str, float]:
             candidates.append(m.group(0))
 
     parsed: Optional[dict] = None
+    parse_errors: List[str] = []
     for cand in candidates:
         cleaned = re.sub(r",\s*}", "}", cand)
         cleaned = re.sub(r",\s*]", "]", cleaned)
         try:
             obj = json.loads(cleaned)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            parse_errors.append(str(e))
             continue
         if isinstance(obj, dict):
             parsed = obj
             break
 
     if parsed is None:
-        # Last resort: key: number pairs
         found: Dict[str, float] = {}
         for key in SCORE_KEYS:
             m = re.search(
@@ -121,22 +122,41 @@ def parse_json_score(text: str) -> Dict[str, float]:
             if m:
                 found[key] = float(m.group(1))
         if not found:
-            return empty
+            snippet = str(text).strip().replace("\n", " ")[:200]
+            raise ValueError(
+                "Could not parse judge JSON scores. Refusing to invent zeros. "
+                f"snippet={snippet!r}; json_errors={parse_errors[:3]}"
+            )
         parsed = found
 
     result: Dict[str, float] = {}
+    missing = []
     for key in SCORE_KEYS:
+        if key == "overall" and key not in parsed:
+            continue
         val = parsed.get(key)
+        if val is None:
+            missing.append(key)
+            continue
         try:
-            result[key] = float(val) if val is not None else 0.0
-        except (TypeError, ValueError):
-            result[key] = 0.0
+            result[key] = float(val)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Judge score field {key!r} is not numeric: {val!r}"
+            ) from e
 
-    if "overall" not in parsed and any(
-        parsed.get(k) is not None for k in SCORE_KEYS[:-1]
-    ):
-        details = [result[k] for k in SCORE_KEYS[:-1]]
+    detail_keys = [k for k in SCORE_KEYS if k != "overall"]
+    if any(k not in result for k in detail_keys):
+        raise ValueError(
+            f"Judge JSON missing required score keys {missing}. Got keys={list(parsed)}. "
+            "Refusing to fill with zeros."
+        )
+
+    if "overall" not in parsed:
+        details = [result[k] for k in detail_keys]
         result["overall"] = sum(details) / len(details)
+    elif "overall" not in result:
+        raise ValueError(f"Judge overall score is not numeric: {parsed.get('overall')!r}")
 
     return result
 

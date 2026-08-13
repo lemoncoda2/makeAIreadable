@@ -40,7 +40,9 @@ See `decoupled_collab/README.md` and `decoupled_collab/GOAL.md` for Phase 0–5.
 ### Gotchas
 
 - Run all training scripts with cwd = `decoupled_collab/` so relative paths in YAML resolve.
-- Qwen3 thinking mode needs `enable_thinking=True` in `apply_chat_template`; if the installed transformers build rejects the kwarg, scripts fall back and log a warning.
-- GRPO reward is **code-execution only** (`utils.code_executor.compute_reward`); never mix readability into the RL reward.
-- Use `--dry_run` / `--mock_judge` on machines without GPU or DeepSeek credentials.
-- V100 is compute capability 7.0: stick to the GOAL pin (`torch` cu121, `vllm==0.6.4`) on the server; newer vLLM may drop V100.
+- **Fail-fast policy**: no silent fallbacks for thinking mode, missing `test_cases`, wrong PEFT args, dry-run placeholder checkpoints, vLLM+LoRA adapter dirs, or unparseable judge JSON. Fix the cause; do not “soft continue”.
+- Qwen3 thinking mode requires `enable_thinking=True`; unsupported transformers → hard error (GOAL pin 4.45 may be too old).
+- GRPO reward is **code-execution only**; missing `test_cases` in the reward kwargs aborts training.
+- `--dry_run` and `--mock_judge` are explicit only. dry-run eval of readability requires `--mock_judge`. Placeholder dirs contain `DRY_RUN_PLACEHOLDER` and are refused by real loads.
+- `inference.use_vllm` defaults to `false` (HF+PEFT). vLLM + LoRA adapter path fails fast.
+- V100 is sm_70: validate torch/vLLM compatibility on the box; do not assume pins work blindly.

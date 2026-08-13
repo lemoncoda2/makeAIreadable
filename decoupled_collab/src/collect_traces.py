@@ -121,8 +121,23 @@ class TraceGenerator:
         self.llm = None
         self.sampling_params = None
 
+        from utils.failfast import (
+            assert_not_adapter_for_vllm,
+            assert_not_dry_run_placeholder,
+            model_input_device,
+            require_cuda,
+            require_thinking_support,
+        )
+        from utils.failfast import apply_chat_template_thinking_strict
+
+        self._apply_chat = apply_chat_template_thinking_strict
+        assert_not_dry_run_placeholder(model_path, what="collect_traces model")
+        require_cuda(dry_run=False)
+
         if use_vllm:
+            assert_not_adapter_for_vllm(model_path)
             from vllm import LLM, SamplingParams
+            from transformers import AutoTokenizer
 
             self.llm = LLM(model=model_path, trust_remote_code=True)
             self.sampling_params = SamplingParams(
@@ -130,55 +145,58 @@ class TraceGenerator:
                 max_tokens=max_new_tokens,
                 top_p=0.9,
             )
-            from transformers import AutoTokenizer
-
             self.tokenizer = AutoTokenizer.from_pretrained(
                 base_model_path or model_path, trust_remote_code=True
             )
+            require_thinking_support(self.tokenizer, enable_thinking=enable_thinking)
         else:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
             from peft import PeftModel
 
-            tok_src = base_model_path or model_path
-            self.tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
+            adapter_cfg = Path(model_path) / "adapter_config.json"
+            if adapter_cfg.exists():
+                if not base_model_path:
+                    raise ValueError(
+                        f"{model_path} is a PEFT adapter but --base_model_path was "
+                        "not provided. Refusing to guess the base model."
+                    )
+                tok_src = base_model_path
+            else:
+                tok_src = base_model_path or model_path
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                tok_src, trust_remote_code=True
+            )
+            require_thinking_support(self.tokenizer, enable_thinking=enable_thinking)
             base = AutoModelForCausalLM.from_pretrained(
                 tok_src,
                 torch_dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True,
             )
-            # If model_path looks like a PEFT adapter, wrap it
-            adapter_cfg = Path(model_path) / "adapter_config.json"
-            if adapter_cfg.exists() and base_model_path:
+            if adapter_cfg.exists():
                 self.model = PeftModel.from_pretrained(base, model_path)
             elif Path(model_path).resolve() != Path(tok_src).resolve():
-                try:
-                    self.model = PeftModel.from_pretrained(base, model_path)
-                except Exception:  # noqa: BLE001
-                    self.model = AutoModelForCausalLM.from_pretrained(
-                        model_path,
-                        torch_dtype=torch.float16,
-                        device_map="auto",
-                        trust_remote_code=True,
-                    )
+                raise ValueError(
+                    f"model_path={model_path} is not a PEFT adapter (no "
+                    f"adapter_config.json) but differs from tokenizer/base "
+                    f"source {tok_src}. Refusing ambiguous load."
+                )
             else:
                 self.model = base
             self.model.eval()
+            self._device = model_input_device(self.model)
 
     def generate(self, task_prompt: str) -> str:
         messages = _build_messages(task_prompt)
-        apply_kwargs: dict[str, Any] = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-        }
-        # Qwen3 thinking flag when supported
-        try:
-            text = self.tokenizer.apply_chat_template(
-                messages, enable_thinking=self.enable_thinking, **apply_kwargs
-            )
-        except TypeError:
-            text = self.tokenizer.apply_chat_template(messages, **apply_kwargs)
+        text = self._apply_chat(
+            self.tokenizer,
+            messages,
+            enable_thinking=self.enable_thinking,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
         if self.use_vllm:
             outputs = self.llm.generate([text], self.sampling_params)
@@ -187,7 +205,7 @@ class TraceGenerator:
         import torch
 
         inputs = self.tokenizer(text, return_tensors="pt")
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
         with torch.no_grad():
             out = self.model.generate(
                 **inputs,

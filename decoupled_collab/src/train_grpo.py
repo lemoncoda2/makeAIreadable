@@ -147,28 +147,35 @@ def build_reward_func(timeout: int = 10, max_test_cases: int = 5):
         n = len(texts)
 
         if test_cases is None:
-            # Fall back: empty tests -> zero reward
-            tcs_batch = [[] for _ in range(n)]
-        else:
-            tcs_batch = list(test_cases)
-            if len(tcs_batch) < n:
-                # Pad if lengths mismatch (should not happen under TRL)
-                tcs_batch = tcs_batch + [tcs_batch[-1] if tcs_batch else []] * (
-                    n - len(tcs_batch)
-                )
-            elif len(tcs_batch) > n:
-                tcs_batch = tcs_batch[:n]
+            raise RuntimeError(
+                "GRPO reward_func did not receive dataset column 'test_cases'. "
+                "Refusing to silently assign 0.0 rewards (that looks like training "
+                "but learns nothing). Ensure remove_unused_columns=False and that "
+                "the train dataset keeps a 'test_cases' field. kwargs keys: "
+                f"{sorted(kwargs.keys())}"
+            )
+        tcs_batch = list(test_cases)
+        if len(tcs_batch) != n:
+            raise RuntimeError(
+                f"GRPO reward length mismatch: len(completions)={n} but "
+                f"len(test_cases)={len(tcs_batch)}. Refusing to pad/truncate "
+                "silently (wrong rewards would be hard to debug)."
+            )
 
         rewards = []
         for text, tcs in zip(texts, tcs_batch):
-            # Ensure list-like test cases (jsonl may store list; HF may nest)
             if isinstance(tcs, str):
                 try:
                     tcs = json.loads(tcs)
-                except json.JSONDecodeError:
-                    tcs = [tcs]
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(
+                        f"test_cases entry is a non-JSON string: {tcs[:80]!r}"
+                    ) from e
             if tcs is None:
-                tcs = []
+                raise RuntimeError(
+                    "Encountered test_cases=None for a completion. "
+                    "Every GRPO row must include a list of assert tests."
+                )
             rewards.append(
                 float(
                     compute_reward(
@@ -256,41 +263,12 @@ def build_grpo_config(cfg: Dict[str, Any], output_dir: Path, report_to: str):
     try:
         return GRPOConfig(**filtered)
     except TypeError as e:
-        # Peel unknown keys until construction succeeds
-        remaining = dict(filtered)
-        last_err: Exception = e
-        for _ in range(len(remaining)):
-            try:
-                return GRPOConfig(**remaining)
-            except TypeError as err:
-                last_err = err
-                msg = str(err)
-                # Heuristic: drop a key mentioned in the error message
-                dropped = False
-                for k in list(remaining.keys()):
-                    if k in msg:
-                        remaining.pop(k, None)
-                        dropped = True
-                        break
-                if not dropped:
-                    # drop an optional GRPO-specific key
-                    for k in (
-                        "scale_rewards",
-                        "epsilon",
-                        "top_p",
-                        "run_name",
-                        "max_completion_length",
-                    ):
-                        if k in remaining:
-                            remaining.pop(k)
-                            dropped = True
-                            break
-                if not dropped:
-                    break
         raise TypeError(
-            f"Failed to construct GRPOConfig with keys {sorted(filtered)}. "
-            f"Original error: {last_err}"
-        ) from last_err
+            "Failed to construct trl.GRPOConfig — refusing to silently drop kwargs. "
+            f"Accepted-by-introspection keys tried: {sorted(filtered)}. "
+            "Align trl version with this script (trl>=0.12) or fix the YAML→TRL "
+            f"field mapping. Underlying error: {e}"
+        ) from e
 
 
 def print_plan(cfg: Dict[str, Any], args: argparse.Namespace, paths: Dict[str, Path]):
@@ -338,9 +316,17 @@ def main() -> int:
     train_file = resolve_path(
         cfg.get("data", {}).get("train_file", "./data/mbpp_train.jsonl"), ROOT
     )
-    base_model = find_base_model_path(
-        model_path, default_base="./models/Qwen3-4B", root=ROOT
-    )
+    try:
+        base_model = find_base_model_path(
+            model_path, default_base="./models/Qwen3-4B", root=ROOT
+        )
+    except FileNotFoundError as e:
+        if args.dry_run:
+            base_model = resolve_path("./models/Qwen3-4B", ROOT)
+            print(f"[dry_run] {e} — using {base_model} in plan only.")
+        else:
+            print(f"[error] {e}")
+            return 1
 
     paths = {
         "config": config_path,
@@ -352,12 +338,45 @@ def main() -> int:
     print_plan(cfg, args, paths)
 
     if args.dry_run:
+        # Still validate known-broken GRPO math so dry-run surfaces config bugs.
+        from utils.failfast import validate_grpo_batch_vs_generations
+
+        try:
+            nproc = int(
+                os.environ.get("WORLD_SIZE")
+                or os.environ.get("ACCELERATE_NUM_PROCESSES")
+                or "4"
+            )
+            validate_grpo_batch_vs_generations(cfg, num_processes=nproc)
+        except Exception as e:  # noqa: BLE001 — surface as dry-run warning exit
+            print(f"[error] Config fail-fast check failed: {e}")
+            return 1
         print("[dry_run] Exiting before model load / training.")
         return 0
 
-    cuda_ok = check_cuda_or_warn(dry_run=False)
-    if not cuda_ok:
+    from utils.failfast import (
+        assert_not_dry_run_placeholder,
+        require_thinking_support,
+        validate_grpo_batch_vs_generations,
+    )
+
+    try:
+        check_cuda_or_warn(dry_run=False)
+    except RuntimeError as e:
+        print(f"[error] {e}")
         return 2
+
+    assert_not_dry_run_placeholder(model_path, what="GRPO model/adapter")
+    nproc = int(
+        os.environ.get("WORLD_SIZE")
+        or os.environ.get("ACCELERATE_NUM_PROCESSES")
+        or "1"
+    )
+    try:
+        validate_grpo_batch_vs_generations(cfg, num_processes=nproc)
+    except Exception as e:  # noqa: BLE001
+        print(f"[error] {e}")
+        return 1
 
     # Import TRL early with a clear message
     try:
@@ -374,12 +393,21 @@ def main() -> int:
         print(f"[error] Training data not found: {train_file}")
         return 1
 
-    report_to = setup_wandb_env(cfg.get("logging"))
+    try:
+        report_to = setup_wandb_env(cfg.get("logging"), dry_run=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[error] {e}")
+        return 1
     enable_thinking = bool(cfg.get("model", {}).get("enable_thinking", True))
     dtype = cfg.get("model", {}).get("torch_dtype", "float16")
 
     print(f"[info] Loading tokenizer from {base_model}")
     tokenizer = load_tokenizer(base_model)
+    try:
+        require_thinking_support(tokenizer, enable_thinking=enable_thinking)
+    except RuntimeError as e:
+        print(f"[error] {e}")
+        return 1
 
     max_tasks = cfg.get("data", {}).get("max_tasks")
     dataset = load_grpo_dataset(
@@ -428,13 +456,25 @@ def main() -> int:
     if peft_config is not None:
         trainer_kwargs["peft_config"] = peft_config
 
-    # Older TRL used `tokenizer=` instead of `processing_class=`
+    # Older TRL used `tokenizer=` instead of `processing_class=` — try once with
+    # an explicit secondary call only when the error names that argument.
     try:
         trainer = GRPOTrainer(**trainer_kwargs)
-    except TypeError:
-        trainer_kwargs.pop("processing_class", None)
-        trainer_kwargs["tokenizer"] = tokenizer
-        trainer = GRPOTrainer(**trainer_kwargs)
+    except TypeError as e:
+        msg = str(e)
+        if "processing_class" in msg or "tokenizer" in msg:
+            print(
+                "[info] GRPOTrainer rejected processing_class=; retrying with "
+                f"tokenizer= (trl API difference). Detail: {e}"
+            )
+            trainer_kwargs.pop("processing_class", None)
+            trainer_kwargs["tokenizer"] = tokenizer
+            trainer = GRPOTrainer(**trainer_kwargs)
+        else:
+            raise TypeError(
+                "GRPOTrainer construction failed. Not retrying with different "
+                f"kwargs (fail-fast). Detail: {e}"
+            ) from e
 
     print("[info] Starting GRPO training...")
     trainer.train()
