@@ -1,0 +1,35 @@
+# DPO training config (GOAL Step 3.4)
+model:
+  name_or_path: ./checkpoints/cycle_0/model_rl
+  torch_dtype: float16
+
+output_dir: ./checkpoints/cycle_0/model_rl_dpo
+
+lora:
+  rank: 32
+  alpha: 64
+  resume_from: ./checkpoints/cycle_0/model_rl
+
+dpo:
+  beta: 0.1
+  loss_type: sigmoid
+  label_smoothing: 0.0
+  reference_free: false
+
+training:
+  learning_rate: 5.0e-6
+  num_epochs: 3
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 4
+  max_length: 1536
+  max_prompt_length: 1024
+  warmup_ratio: 0.1
+  fp16: true
+
+data:
+  train_file: ./data/dpo_pairs/cycle_0_filtered_pairs.jsonl
+  eval_split: 0.05
+
+logging:
+  wandb_project: decoupled-collab
+  wandb_run: cycle0_dpo

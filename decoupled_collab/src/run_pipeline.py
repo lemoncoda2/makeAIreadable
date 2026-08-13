@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""
+Full automation pipeline — supports resume and dry-run.
+
+Usage:
+  python src/run_pipeline.py --config configs/pipeline_config.yaml [--resume]
+  python src/run_pipeline.py --config configs/pipeline_config.yaml --dry_run
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+STATE_FILE_NAME = "pipeline_state.json"
+
+PHASES = [
+    "phase1_grpo",
+    "phase1_eval",
+    "phase2_collect",
+    "phase3_regen",
+    "phase3_filter",
+    "phase3_dpo",
+    "phase4_eval",
+]
+
+
+def load_config(config_path: Path) -> dict[str, Any]:
+    try:
+        import yaml
+    except ImportError as e:
+        raise ImportError("PyYAML is required: pip install pyyaml") from e
+
+    with open(config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    # Resolve relative paths against project_root (default: ROOT)
+    project_root = Path(cfg.get("general", {}).get("project_root", ".")).expanduser()
+    if not project_root.is_absolute():
+        project_root = (ROOT / project_root).resolve()
+    cfg["_project_root"] = str(project_root)
+    cfg["_config_path"] = str(config_path.resolve())
+    return cfg
+
+
+def state_path(project_root: Path) -> Path:
+    return project_root / STATE_FILE_NAME
+
+
+def load_state(project_root: Path, *, resume: bool, cycle_id: Optional[int]) -> dict[str, Any]:
+    """
+    Always attempt to load existing state when --resume is set.
+    When not resuming, start fresh (but still overwrite STATE_FILE as we go).
+
+    Fixes GOAL bugs:
+    - resume always loaded state even when resume=False (both branches identical)
+    - start_phase indexing crashed when current_phase missing from PHASES
+    """
+    path = state_path(project_root)
+    if resume and path.exists():
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+        print(f"[state] Resuming from {path}")
+    else:
+        state = {
+            "status": "running",
+            "current_cycle": cycle_id if cycle_id is not None else 0,
+            "current_phase": PHASES[0],
+            "history": [],
+        }
+        if not resume:
+            print("[state] Starting fresh pipeline state")
+
+    if cycle_id is not None:
+        state["current_cycle"] = cycle_id
+        # When jumping to a specific cycle without resume, reset phase
+        if not resume:
+            state["current_phase"] = PHASES[0]
+
+    return state
+
+
+def save_state(project_root: Path, state: dict[str, Any]) -> None:
+    state["last_update"] = datetime.now(timezone.utc).isoformat()
+    path = state_path(project_root)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def phases_from(current_phase: Optional[str]) -> list[str]:
+    """Return PHASES slice starting at current_phase; safe if phase missing."""
+    if not current_phase:
+        return list(PHASES)
+    try:
+        idx = PHASES.index(current_phase)
+    except ValueError:
+        print(
+            f"[warn] Unknown current_phase={current_phase!r}; "
+            f"restarting from {PHASES[0]}"
+        )
+        idx = 0
+    return PHASES[idx:]
+
+
+def run_cmd(cmd: str, log_file: Path, *, cwd: Path) -> None:
+    print(f"[CMD] {cmd}")
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(f"\n===== {datetime.now(timezone.utc).isoformat()} =====\n")
+        f.write(cmd + "\n")
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            cwd=str(cwd),
+        )
+    if result.returncode != 0:
+        raise RuntimeError(f"Command failed (exit={result.returncode}): {cmd}")
+
+
+def resolve_path(project_root: Path, p: str | Path) -> Path:
+    path = Path(p)
+    if path.is_absolute():
+        return path
+    return (project_root / path).resolve()
+
+
+def get_model_path(
+    cycle: int,
+    phase: str,
+    config: dict[str, Any],
+    *,
+    start_model: Optional[str],
+) -> str:
+    project_root = Path(config["_project_root"])
+    base = config["general"]["base_model"]
+    if cycle == 0 and phase == "phase1_grpo":
+        return str(resolve_path(project_root, start_model or base))
+    if phase == "phase1_grpo":
+        if start_model and cycle == config.get("_start_cycle", 0):
+            return str(resolve_path(project_root, start_model))
+        return str(resolve_path(project_root, f"./checkpoints/cycle_{cycle - 1}/model_rl_dpo"))
+    if phase == "phase3_dpo":
+        return str(resolve_path(project_root, f"./checkpoints/cycle_{cycle}/model_rl"))
+    return str(resolve_path(project_root, base))
+
+
+def _py() -> str:
+    return shlex.quote(sys.executable)
+
+
+def _flag(dry_run: bool) -> str:
+    return " --dry_run" if dry_run else ""
+
+
+def run_phase(
+    phase: str,
+    cycle: int,
+    config: dict[str, Any],
+    *,
+    start_model: Optional[str],
+    dry_run: bool,
+) -> None:
+    project_root = Path(config["_project_root"])
+    cycle_dir = resolve_path(project_root, f"./checkpoints/cycle_{cycle}")
+    log_dir = resolve_path(project_root, f"./logs/cycle_{cycle}")
+    cycle_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    num_gpus = int(config["general"].get("num_gpus", 4))
+    grpo_cfg = resolve_path(project_root, config["grpo"]["config"])
+    dpo_cfg = resolve_path(project_root, config["dpo"]["config"])
+    num_collect = int(config["grpo"].get("num_tasks_collect", 2000))
+    threshold = float(config["dpo"].get("threshold", 6.0))
+    eval_cfg = config.get("eval", {})
+    mbpp_plus = resolve_path(
+        project_root, eval_cfg.get("mbpp_plus", "./data/mbpp_plus_test.jsonl")
+    )
+    lcb_easy = resolve_path(project_root, eval_cfg.get("lcb_easy", "./data/lcb_easy.jsonl"))
+    n_bench = int(eval_cfg.get("num_tasks_benchmark", 200))
+    n_read = int(eval_cfg.get("num_tasks_readability", 50))
+    base_model = str(resolve_path(project_root, config["general"]["base_model"]))
+
+    py = _py()
+    dry = _flag(dry_run)
+
+    if phase == "phase1_grpo":
+        model = get_model_path(cycle, phase, config, start_model=start_model)
+        out = cycle_dir / "model_rl"
+        if dry_run:
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "DRY_RUN_PLACEHOLDER").write_text(
+                f"dry_run grpo from {model}\n", encoding="utf-8"
+            )
+            print(f"[dry_run] Skipped GRPO training; placeholder at {out}")
+            return
+        train_script = project_root / "src" / "train_grpo.py"
+        if not train_script.exists():
+            raise FileNotFoundError(
+                f"Missing {train_script}. Implement GRPO training before running without --dry_run."
+            )
+        run_cmd(
+            f"accelerate launch --num_processes {num_gpus} {shlex.quote(str(train_script))} "
+            f"--config {shlex.quote(str(grpo_cfg))} "
+            f"--model {shlex.quote(model)} --output {shlex.quote(str(out))}",
+            log_dir / "grpo.log",
+            cwd=project_root,
+        )
+
+    elif phase == "phase1_eval":
+        out = cycle_dir / "phase1_check.json"
+        run_cmd(
+            f"{py} src/evaluate.py --mode hypothesis_check "
+            f"--base_model {shlex.quote(base_model)} "
+            f"--rl_model {shlex.quote(str(cycle_dir / 'model_rl'))} "
+            f"--eval_data {shlex.quote(str(mbpp_plus))} "
+            f"--num_tasks_benchmark {n_bench} --num_tasks_readability {n_read} "
+            f"--output {shlex.quote(str(out))}{dry}"
+            + (" --mock_judge" if dry_run else ""),
+            log_dir / "phase1_eval.log",
+            cwd=project_root,
+        )
+
+    elif phase == "phase2_collect":
+        out = resolve_path(project_root, f"./data/traces/cycle_{cycle}_traces.jsonl")
+        train_tasks = resolve_path(project_root, "./data/mbpp_train.jsonl")
+        run_cmd(
+            f"{py} src/collect_traces.py "
+            f"--model {shlex.quote(str(cycle_dir / 'model_rl'))} "
+            f"--base_model_path {shlex.quote(base_model)} "
+            f"--tasks {shlex.quote(str(train_tasks))} "
+            f"--output {shlex.quote(str(out))} "
+            f"--num_tasks {num_collect} "
+            f"--use_vllm {'false' if dry_run else 'true'}"
+            f"{dry}",
+            log_dir / "collect.log",
+            cwd=project_root,
+        )
+
+    elif phase == "phase3_regen":
+        traces = resolve_path(project_root, f"./data/traces/cycle_{cycle}_traces.jsonl")
+        out = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_raw.jsonl")
+        run_cmd(
+            f"{py} src/regen_collaboration.py "
+            f"--base_model {shlex.quote(base_model)} "
+            f"--traces {shlex.quote(str(traces))} "
+            f"--output {shlex.quote(str(out))} "
+            f"--use_vllm {'false' if dry_run else 'true'}"
+            f"{dry}",
+            log_dir / "regen.log",
+            cwd=project_root,
+        )
+
+    elif phase == "phase3_filter":
+        raw = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_raw.jsonl")
+        out = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_filtered.jsonl")
+        mock = " --mock_judge" if dry_run else ""
+        run_cmd(
+            f"{py} src/filter_pairs.py "
+            f"--raw_pairs {shlex.quote(str(raw))} "
+            f"--output {shlex.quote(str(out))} "
+            f"--judge_api deepseek --threshold {threshold}{mock}",
+            log_dir / "filter.log",
+            cwd=project_root,
+        )
+
+    elif phase == "phase3_dpo":
+        model = get_model_path(cycle, phase, config, start_model=start_model)
+        dpo_data = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_filtered.jsonl")
+        out = cycle_dir / "model_rl_dpo"
+        if dry_run:
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "DRY_RUN_PLACEHOLDER").write_text(
+                f"dry_run dpo from {model}\n", encoding="utf-8"
+            )
+            print(f"[dry_run] Skipped DPO training; placeholder at {out}")
+            return
+        train_script = project_root / "src" / "train_dpo.py"
+        if not train_script.exists():
+            raise FileNotFoundError(
+                f"Missing {train_script}. Implement DPO training before running without --dry_run."
+            )
+        run_cmd(
+            f"{py} {shlex.quote(str(train_script))} --config {shlex.quote(str(dpo_cfg))} "
+            f"--model {shlex.quote(model)} "
+            f"--dpo_data {shlex.quote(str(dpo_data))} "
+            f"--output {shlex.quote(str(out))}",
+            log_dir / "dpo.log",
+            cwd=project_root,
+        )
+
+    elif phase == "phase4_eval":
+        out = resolve_path(project_root, f"./results/cycle_{cycle}_eval.json")
+        run_cmd(
+            f"{py} src/evaluate.py --mode full "
+            f"--models base,rl,final "
+            f"--base_model {shlex.quote(base_model)} "
+            f"--rl_model {shlex.quote(str(cycle_dir / 'model_rl'))} "
+            f"--final_model {shlex.quote(str(cycle_dir / 'model_rl_dpo'))} "
+            f"--eval_data {shlex.quote(str(mbpp_plus))} "
+            f"--lcb_data {shlex.quote(str(lcb_easy))} "
+            f"--num_tasks_benchmark {n_bench} --num_tasks_readability {n_read} "
+            f"--cycle {cycle} "
+            f"--output {shlex.quote(str(out))}{dry}"
+            + (" --mock_judge" if dry_run else ""),
+            log_dir / "eval.log",
+            cwd=project_root,
+        )
+
+    else:
+        raise ValueError(f"Unknown phase: {phase}")
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Decoupled-collab master pipeline")
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--cycle_id", type=int, default=None)
+    parser.add_argument("--start_model", default=None)
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Pass dry_run/mock_judge to children; skip GPU training phases",
+    )
+    parser.add_argument(
+        "--only_phase",
+        default=None,
+        help="Run a single phase name (for smoke tests)",
+    )
+    args = parser.parse_args(argv)
+
+    config_path = args.config
+    if not config_path.is_absolute():
+        config_path = (ROOT / config_path).resolve()
+
+    config = load_config(config_path)
+    project_root = Path(config["_project_root"])
+    os.chdir(project_root)
+
+    state = load_state(project_root, resume=args.resume, cycle_id=args.cycle_id)
+    start_cycle = int(state.get("current_cycle", 0))
+    config["_start_cycle"] = start_cycle
+    num_cycles = int(config["general"].get("num_cycles", 2))
+
+    if args.only_phase:
+        if args.only_phase not in PHASES:
+            raise SystemExit(f"--only_phase must be one of {PHASES}")
+        cycle = start_cycle
+        state["current_cycle"] = cycle
+        state["current_phase"] = args.only_phase
+        save_state(project_root, state)
+        print(f"\n{'=' * 60}\n  Cycle {cycle} | Phase: {args.only_phase}\n{'=' * 60}\n")
+        run_phase(
+            args.only_phase,
+            cycle,
+            config,
+            start_model=args.start_model,
+            dry_run=args.dry_run,
+        )
+        save_state(project_root, state)
+        print("✓ Single phase completed")
+        return
+
+    for cycle in range(start_cycle, num_cycles):
+        state["current_cycle"] = cycle
+        # On first cycle of this run, continue from saved phase; later cycles restart
+        if cycle == start_cycle:
+            phases_to_run = phases_from(state.get("current_phase"))
+        else:
+            phases_to_run = list(PHASES)
+
+        for phase in phases_to_run:
+            state["current_phase"] = phase
+            save_state(project_root, state)
+
+            print(f"\n{'=' * 60}")
+            print(f"  Cycle {cycle} | Phase: {phase}")
+            print(f"{'=' * 60}\n")
+
+            run_phase(
+                phase,
+                cycle,
+                config,
+                start_model=args.start_model,
+                dry_run=args.dry_run,
+            )
+
+        state["current_phase"] = PHASES[0]
+        state.setdefault("history", []).append(
+            {
+                "cycle": cycle,
+                "completed": datetime.now(timezone.utc).isoformat(),
+                "results": f"./results/cycle_{cycle}_eval.json",
+            }
+        )
+        save_state(project_root, state)
+
+    state["status"] = "completed"
+    save_state(project_root, state)
+    print("\n✓ All cycles completed!")
+
+
+if __name__ == "__main__":
+    main()

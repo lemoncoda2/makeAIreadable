@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Filter DPO pairs with DeepSeek readability judge (GOAL Step 3.2)."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from utils.api_judge import (  # noqa: E402
+    filter_pair,
+    get_deepseek_async_client,
+    judge_collaboration_async,
+    mock_judge_scores,
+)
+from utils.prompts import build_dpo_prompt  # noqa: E402
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def to_dpo_record(
+    pair: dict[str, Any],
+    regen_score: dict[str, float],
+    rl_score: dict[str, float],
+) -> dict[str, Any]:
+    return {
+        "prompt": build_dpo_prompt(
+            pair.get("task_prompt", ""),
+            pair.get("thinking", ""),
+            pair.get("code", ""),
+        ),
+        "chosen": pair.get("regen_collaboration", ""),
+        "rejected": pair.get("rl_collaboration", ""),
+        "metadata": {
+            "task_id": pair.get("task_id"),
+            "regen_score": regen_score,
+            "rl_score": rl_score,
+            "reward": pair.get("reward"),
+            "score_gap": float(regen_score.get("overall", 0))
+            - float(rl_score.get("overall", 0)),
+        },
+    }
+
+
+async def _score_pair_async(
+    client: Any,
+    pair: dict[str, Any],
+    sem: asyncio.Semaphore,
+    *,
+    model: Optional[str],
+    max_retries: int,
+) -> tuple[dict[str, float], dict[str, float]]:
+    async with sem:
+        regen_score, rl_score = await asyncio.gather(
+            judge_collaboration_async(
+                pair.get("task_prompt", ""),
+                pair.get("regen_collaboration", ""),
+                client=client,
+                model=model,
+                max_retries=max_retries,
+            ),
+            judge_collaboration_async(
+                pair.get("task_prompt", ""),
+                pair.get("rl_collaboration", ""),
+                client=client,
+                model=model,
+                max_retries=max_retries,
+            ),
+        )
+        return regen_score, rl_score
+
+
+async def filter_async(
+    pairs: list[dict[str, Any]],
+    *,
+    threshold: float,
+    max_concurrent: int,
+    model: Optional[str],
+    max_retries: int,
+    batch_size: int,
+) -> list[dict[str, Any]]:
+    client = get_deepseek_async_client()
+    sem = asyncio.Semaphore(max_concurrent)
+    kept: list[dict[str, Any]] = []
+
+    try:
+        for start in range(0, len(pairs), batch_size):
+            batch = pairs[start : start + batch_size]
+            results = await asyncio.gather(
+                *[
+                    _score_pair_async(
+                        client, p, sem, model=model, max_retries=max_retries
+                    )
+                    for p in batch
+                ],
+                return_exceptions=True,
+            )
+            for pair, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    print(f"[warn] scoring failed for {pair.get('task_id')}: {result}")
+                    continue
+                regen_score, rl_score = result
+                if filter_pair(regen_score, rl_score, threshold=threshold):
+                    kept.append(to_dpo_record(pair, regen_score, rl_score))
+            print(
+                f"Processed {min(start + batch_size, len(pairs))}/{len(pairs)}; "
+                f"kept {len(kept)}"
+            )
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
+
+    return kept
+
+
+def filter_mock(pairs: list[dict[str, Any]], *, threshold: float) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for pair in pairs:
+        regen_score, rl_score = mock_judge_scores(
+            pair.get("regen_collaboration", ""),
+            pair.get("rl_collaboration", ""),
+        )
+        if filter_pair(regen_score, rl_score, threshold=threshold):
+            kept.append(to_dpo_record(pair, regen_score, rl_score))
+    return kept
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Filter DPO pairs (GOAL Step 3.2)")
+    parser.add_argument("--raw_pairs", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--judge_api", default="deepseek")
+    parser.add_argument("--threshold", type=float, default=6.0)
+    parser.add_argument("--batch_size", type=int, default=20)
+    parser.add_argument("--max_concurrent", type=int, default=5)
+    parser.add_argument("--max_retries", type=int, default=5)
+    parser.add_argument("--judge_model", default=None)
+    parser.add_argument(
+        "--mock_judge",
+        action="store_true",
+        help="Offline: synthetic scores so regen > rl when texts differ",
+    )
+    parser.add_argument("--limit", type=int, default=None)
+    args = parser.parse_args(argv)
+
+    pairs = load_jsonl(args.raw_pairs)
+    if args.limit is not None:
+        pairs = pairs[: args.limit]
+
+    print(f"Loaded {len(pairs)} raw pairs from {args.raw_pairs}")
+
+    if args.mock_judge or args.judge_api == "mock":
+        kept = filter_mock(pairs, threshold=args.threshold)
+    else:
+        kept = asyncio.run(
+            filter_async(
+                pairs,
+                threshold=args.threshold,
+                max_concurrent=args.max_concurrent,
+                model=args.judge_model,
+                max_retries=args.max_retries,
+                batch_size=args.batch_size,
+            )
+        )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, "w", encoding="utf-8") as f:
+        for rec in kept:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    print(f"Kept {len(kept)}/{len(pairs)} pairs → {args.output}")
+
+
+if __name__ == "__main__":
+    main()
