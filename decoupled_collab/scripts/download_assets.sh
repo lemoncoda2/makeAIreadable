@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download Qwen3-4B + prepare MBPP datasets (GOAL Step 0.3 / 0.4)
+# Download Qwen3-4B + REAL benchmarks (MBPP full, MBPP+/EvalPlus, LCB-easy)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,8 +18,20 @@ print("Downloaded via huggingface_hub.snapshot_download")
 PY
 fi
 
-echo "==> Preparing MBPP via datasets.load_dataset (--download)"
+echo "==> Preparing REAL datasets (MBPP full + EvalPlus MBPP+ + LiveCodeBench-easy)"
+echo "    This REQUIRES network. Synthetic/example jsonl are NOT enough for training/eval."
+python3 src/prepare_data.py --download --list-benchmarks
 python3 src/prepare_data.py --download
 
+echo "==> Verifying dataset gates"
+python3 - <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, "src")
+from utils.benchmarks import require_real_benchmarks, list_benchmarks
+require_real_benchmarks(Path("."), ["mbpp_train", "mbpp_plus", "lcb_easy"])
+print(list_benchmarks())
+print("✓ Real benchmarks present")
+PY
+
 echo "✓ download_assets.sh finished"
-echo "Note: LiveCodeBench easy may be empty/placeholder; see prepare_data.prepare_lcb_easy docs."

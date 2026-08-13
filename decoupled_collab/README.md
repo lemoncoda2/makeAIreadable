@@ -28,6 +28,20 @@ bash scripts/setup_env.sh          # INSTALL_VLLM=0 to skip vLLM
 
 Details and rationale: `GOAL.md` Step 0.2 / root `GOAL_decoupled_collaboration.md`.
 
+### Benchmarks (must download before real runs)
+
+| Key | Role | Source | File |
+|-----|------|--------|------|
+| `mbpp_train` | GRPO training prompts | HF MBPP **full** | `data/mbpp_train.jsonl` |
+| `mbpp_plus` | Primary eval | **EvalPlus MBPP+** | `data/mbpp_plus_test.jsonl` |
+| `lcb_easy` | Secondary eval | LiveCodeBench **easy** | `data/lcb_easy.jsonl` |
+
+```bash
+python src/prepare_data.py --list-benchmarks
+python src/prepare_data.py --download   # network required
+# train / evaluate / run_pipeline (non-dry-run) refuse synthetic/empty/wrong-source files
+```
+
 ## Layout
 
 ```

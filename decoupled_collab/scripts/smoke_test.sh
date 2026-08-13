@@ -12,7 +12,7 @@ fi
 
 export PYTHONPATH="${ROOT}/src:${PYTHONPATH:-}"
 
-echo "==> Writing tiny synthetic MBPP fixtures"
+echo "==> Writing tiny SYNTHETIC fixtures (smoke/dry_run only; real runs refuse these)"
 "$PYTHON" - <<'PY'
 import json
 from pathlib import Path
@@ -25,21 +25,42 @@ train = [
         "prompt": "Write a function to add two numbers.",
         "test_cases": ["assert add(1, 2) == 3", "assert add(0, 0) == 0"],
         "code_solution": "def add(a, b):\n    return a + b\n",
+        "source": "mbpp_full",
+        "benchmark": "mbpp_train",
+        "synthetic": True,
     },
     {
         "task_id": "mbpp_2",
         "prompt": "Write a function to return the maximum of two numbers.",
         "test_cases": ["assert maximum(1, 2) == 2"],
         "code_solution": "def maximum(a, b):\n    return a if a > b else b\n",
+        "source": "mbpp_full",
+        "benchmark": "mbpp_train",
+        "synthetic": True,
     },
 ]
 eval_tasks = [
     {
-        "task_id": "mbpp_101",
+        "task_id": "Mbpp/101",
         "prompt": "Write a function to check if a number is even.",
         "test_cases": ["assert is_even(2) == True", "assert is_even(3) == False"],
         "entry_point": "is_even",
         "code_solution": "def is_even(n):\n    return n % 2 == 0\n",
+        "source": "evalplus_mbpp_plus",
+        "benchmark": "mbpp_plus",
+        "synthetic": True,
+    }
+]
+lcb = [
+    {
+        "task_id": "lcb_smoke_1",
+        "prompt": "Write a function that returns 1.",
+        "test_cases": ["assert solution() == 1"],
+        "code_solution": "def solution():\n    return 1\n",
+        "source": "livecodebench_easy",
+        "benchmark": "lcb_easy",
+        "synthetic": True,
+        "difficulty": "easy",
     }
 ]
 with open("data/mbpp_train.jsonl", "w") as f:
@@ -48,8 +69,10 @@ with open("data/mbpp_train.jsonl", "w") as f:
 with open("data/mbpp_plus_test.jsonl", "w") as f:
     for t in eval_tasks:
         f.write(json.dumps(t) + "\n")
-Path("data/lcb_easy.jsonl").write_text("")
-print("fixtures ok")
+with open("data/lcb_easy.jsonl", "w") as f:
+    for t in lcb:
+        f.write(json.dumps(t) + "\n")
+print("synthetic fixtures ok (NOT for real training)")
 PY
 
 echo "==> pytest"
@@ -89,9 +112,11 @@ echo "==> dry_run collect → regen → filter → evaluate"
   --rl_model ./checkpoints/cycle_0/model_rl \
   --final_model ./checkpoints/cycle_0/model_rl_dpo \
   --eval_data ./data/mbpp_plus_test.jsonl \
+  --lcb_data ./data/lcb_easy.jsonl \
   --num_tasks_benchmark 1 \
   --num_tasks_readability 1 \
   --dry_run \
+  --allow_synthetic \
   --mock_judge \
   --output ./results/smoke_eval.json
 

@@ -80,3 +80,11 @@ def test_thinking_template_no_silent_fallback():
             [{"role": "user", "content": "hi"}],
             enable_thinking=True,
         )
+
+
+def test_list_benchmarks_mentions_three():
+    from utils.benchmarks import BENCHMARKS, list_benchmarks
+
+    text = list_benchmarks()
+    assert "mbpp_plus" in text and "lcb_easy" in text and "mbpp_train" in text
+    assert set(BENCHMARKS) == {"mbpp_train", "mbpp_plus", "lcb_easy"}

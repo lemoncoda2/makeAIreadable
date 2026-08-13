@@ -393,6 +393,15 @@ def main() -> int:
         print(f"[error] Training data not found: {train_file}")
         return 1
 
+    from utils.benchmarks import require_real_benchmark
+    from utils.failfast import ConfigError
+
+    try:
+        require_real_benchmark("mbpp_train", train_file, allow_synthetic=False)
+    except ConfigError as e:
+        print(f"[error] {e}")
+        return 1
+
     try:
         report_to = setup_wandb_env(cfg.get("logging"), dry_run=False)
     except Exception as e:  # noqa: BLE001

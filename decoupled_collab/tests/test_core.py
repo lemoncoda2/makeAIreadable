@@ -17,6 +17,8 @@ from prepare_data import (  # noqa: E402
     prepare_grpo_tasks,
     prepare_lcb_easy,
 )
+from utils.benchmarks import require_real_benchmark  # noqa: E402
+from utils.failfast import ConfigError  # noqa: E402
 from utils.api_judge import filter_pair, mock_judge_scores, parse_json_score  # noqa: E402
 from utils.code_executor import compute_reward, execute_test, separate_output  # noqa: E402
 from utils.metrics import hypothesis_check  # noqa: E402
@@ -79,7 +81,7 @@ def test_hypothesis_results():
     assert h["H4_dpo_preserves_coding"]["verified"] is True
 
 
-def test_prepare_data_from_fake_disk(tmp_path, monkeypatch):
+def test_prepare_grpo_tasks_from_fake_disk(tmp_path, monkeypatch):
     import prepare_data as pd
 
     fake_full = {
@@ -92,36 +94,59 @@ def test_prepare_data_from_fake_disk(tmp_path, monkeypatch):
             }
         ]
     }
-    fake_san = {
-        "test": [
-            {
-                "task_id": 2,
-                "text": "sub",
-                "test_list": ["assert sub(3,1)==2"],
-                "code": "def sub(a,b): return a-b",
-            }
-        ]
-    }
 
     def fake_load(path, download, config_name):
-        return fake_full if config_name == "full" else fake_san
+        assert config_name == "full"
+        return fake_full
 
     monkeypatch.setattr(pd, "_load_mbpp", fake_load)
     train_out = tmp_path / "train.jsonl"
-    eval_out = tmp_path / "eval.jsonl"
     prepare_grpo_tasks(tmp_path / "full", train_out, download=False)
-    prepare_eval_tasks(tmp_path / "san", eval_out, download=False)
-    assert train_out.read_text().strip()
-    assert "mbpp_2" in eval_out.read_text()
-    assert json.loads(eval_out.read_text().strip())["entry_point"] == "sub"
+    row = json.loads(train_out.read_text().strip())
+    assert row["source"] == "mbpp_full"
+    assert row["synthetic"] is False
 
 
-def test_prepare_lcb_easy_placeholder(tmp_path):
+def test_prepare_eval_tasks_disabled():
+    import prepare_data as pd
+    import pytest
+
+    with pytest.raises(RuntimeError, match="EvalPlus"):
+        pd.prepare_eval_tasks(Path("x"), Path("y"), download=False)
+
+
+def test_prepare_lcb_easy_fails_without_data(tmp_path, monkeypatch):
+    import sys
+    import prepare_data as pd
+
+    class FakeDS:
+        @staticmethod
+        def load_dataset(*a, **k):
+            raise RuntimeError("offline")
+
+    monkeypatch.setitem(sys.modules, "datasets", FakeDS())
     out = tmp_path / "lcb.jsonl"
-    with pytest.warns(UserWarning):
-        tasks = prepare_lcb_easy(out)
-    assert out.exists()
-    assert isinstance(tasks, list)
+    with pytest.raises(RuntimeError, match="LiveCodeBench"):
+        pd.prepare_lcb_easy(out, download=True)
+
+
+def test_require_real_benchmark_rejects_synthetic(tmp_path):
+    p = tmp_path / "mbpp_plus_test.jsonl"
+    p.write_text(
+        json.dumps(
+            {
+                "task_id": "Mbpp/1",
+                "prompt": "x",
+                "test_cases": ["assert True"],
+                "source": "evalplus_mbpp_plus",
+                "synthetic": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="synthetic"):
+        require_real_benchmark("mbpp_plus", p, allow_synthetic=False)
 
 
 def test_run_pipeline_phases_from():

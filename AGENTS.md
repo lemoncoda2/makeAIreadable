@@ -24,7 +24,8 @@ See `decoupled_collab/README.md` and `decoupled_collab/GOAL.md` for Phase 0–5.
 | Task | Command |
 |------|---------|
 | Smoke (no GPU) | `bash scripts/smoke_test.sh` |
-| Prep data | `python src/prepare_data.py --download` |
+| List benchmarks | `python src/prepare_data.py --list-benchmarks` |
+| Prep **real** data | `python src/prepare_data.py --download` (EvalPlus MBPP+ + MBPP full + LCB-easy) |
 | GRPO (4 GPU) | `accelerate launch --num_processes 4 src/train_grpo.py --config configs/grpo_config.yaml` |
 | Full cycles | `python src/run_pipeline.py --config configs/pipeline_config.yaml` |
 | Resume | `python src/run_pipeline.py --config configs/pipeline_config.yaml --resume` |
