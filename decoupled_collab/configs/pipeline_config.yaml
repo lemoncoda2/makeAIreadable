@@ -1,0 +1,16 @@
+general:
+  base_model: ./models/Qwen3-4B
+  num_cycles: 2
+  project_root: .
+  num_gpus: 4
+grpo:
+  config: configs/grpo_config.yaml
+  num_tasks_collect: 2000
+dpo:
+  config: configs/dpo_config.yaml
+  threshold: 6.0
+eval:
+  num_tasks_benchmark: 200
+  num_tasks_readability: 50
+  mbpp_plus: ./data/mbpp_plus_test.jsonl
+  lcb_easy: ./data/lcb_easy.jsonl

@@ -1,0 +1,25 @@
+# Decoupled Collaboration Training — Python dependencies (GOAL Step 0.2)
+#
+# Install PyTorch with CUDA 12.1 first (V100 server):
+#   pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+#
+# Then:
+#   pip install -r requirements.txt
+
+transformers==4.45.0
+vllm==0.6.4
+trl==0.12.0
+peft==0.13.0
+bitsandbytes==0.44.1
+datasets==3.0.0
+accelerate==1.0.0
+deepspeed==0.15.0
+openai>=1.40.0
+evalplus
+wandb
+jsonlines
+rich
+pyyaml>=6.0
+tqdm
+pytest>=7.0
+huggingface_hub
