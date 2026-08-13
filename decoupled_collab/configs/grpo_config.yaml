@@ -1,0 +1,54 @@
+# GRPO training config (GOAL Step 1.1)
+model:
+  name_or_path: ./models/Qwen3-4B
+  torch_dtype: float16
+  enable_thinking: true
+
+output_dir: ./checkpoints/cycle_0/model_rl
+
+lora:
+  rank: 32
+  alpha: 64
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  dropout: 0.05
+
+grpo:
+  num_samples_per_prompt: 6
+  max_new_tokens: 768
+  temperature: 0.7
+  top_p: 0.9
+  kl_coeff: 0.04
+  clip_range: 0.2
+  normalize_reward: true
+
+training:
+  learning_rate: 2.0e-5
+  num_epochs: 3
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 6
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  fp16: true
+  dataloader_num_workers: 4
+
+data:
+  train_file: ./data/mbpp_train.jsonl
+  max_tasks: 600
+
+reward:
+  type: code_execution
+  timeout: 10
+  max_test_cases: 5
+
+logging:
+  wandb_project: decoupled-collab
+  wandb_run: cycle0_grpo
+  log_every_n_steps: 10
+  save_every_n_steps: 200
