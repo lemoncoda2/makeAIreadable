@@ -320,51 +320,42 @@ def prepare_lcb_easy(output: Path, *, download: bool = False) -> list[dict[str, 
                     or item.get("question")
                     or ""
                 )
+                from utils.lcb_executor import parse_public_test_cases
+
                 raw_tests = (
                     item.get("public_test_cases")
+                    or item.get("input_output")
                     or item.get("test_cases")
                     or item.get("tests")
                     or []
                 )
-                if isinstance(raw_tests, str):
+                lcb_tests = parse_public_test_cases(raw_tests)
+                # Some HF rows put fn_name only in metadata
+                meta = item.get("metadata") or {}
+                if isinstance(meta, str):
                     try:
-                        raw_tests = json.loads(raw_tests)
+                        meta = json.loads(meta)
                     except json.JSONDecodeError:
-                        raw_tests = [raw_tests]
-                # Prefer assert-style strings; JSON dumps are NOT executable by
-                # code_executor (evaluate refuses LCB if coverage is too low).
-                test_cases: list[str] = []
-                for tc in raw_tests:
-                    if isinstance(tc, str):
-                        s = tc.strip()
-                        if s.startswith("assert") or s.startswith("assert("):
-                            test_cases.append(s)
-                        else:
-                            # Keep raw string only if it looks like an assert later;
-                            # skip opaque payloads that would fake a prepared dataset.
-                            try:
-                                parsed = json.loads(s)
-                            except json.JSONDecodeError:
-                                test_cases.append(s)
-                                continue
-                            if isinstance(parsed, dict) and (
-                                "assert" in parsed or "code" in parsed
-                            ):
-                                test_cases.append(s)
-                            # else: drop stdin JSON blobs (not runnable here)
-                    elif isinstance(tc, dict):
-                        # Functional: {"input": ..., "output": ...} needs a harness —
-                        # do not store json.dumps as a fake "test".
-                        continue
-                    else:
-                        continue
-                if not prompt or not test_cases:
+                        meta = {}
+                fn_name = None
+                if isinstance(meta, dict):
+                    fn_name = meta.get("func_name") or meta.get("fn_name")
+                if fn_name:
+                    for c in lcb_tests:
+                        if c.get("type") == "call" and not c.get("fn_name"):
+                            c["fn_name"] = fn_name
+                if not prompt or not lcb_tests:
                     continue
                 tasks.append(
                     {
                         "task_id": f"lcb_{item.get('question_id', item.get('task_id', i))}",
                         "prompt": prompt,
-                        "test_cases": test_cases,
+                        # Structured cases for utils.lcb_executor (stdin / call).
+                        "harness": "lcb",
+                        "lcb_tests": lcb_tests,
+                        # Keep empty assert list so MBPP-style executors do not
+                        # mis-read JSON dumps as Python asserts.
+                        "test_cases": [],
                         "difficulty": "easy",
                         "source": "livecodebench_easy",
                         "benchmark": "lcb_easy",
@@ -388,7 +379,9 @@ def prepare_lcb_easy(output: Path, *, download: bool = False) -> list[dict[str, 
             "Manual options:\n"
             "  1) Clone https://github.com/LiveCodeBench/LiveCodeBench and convert easy split\n"
             "  2) Write data/lcb_easy.jsonl with fields: "
-            "task_id, prompt, test_cases, source='livecodebench_easy', synthetic=false\n"
+            "task_id, prompt, harness='lcb', lcb_tests=[...], "
+            "source='livecodebench_easy', synthetic=false\n"
+            "  lcb_tests entries: {type: stdin|call, input, output, fn_name?}\n"
             "Refusing to write an empty stub that would fake a successful prepare."
         )
         if download:

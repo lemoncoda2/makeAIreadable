@@ -55,6 +55,8 @@ JUDGE_PROMPT = """请评估以下AI编程助手回复的协作质量。
 请直接输出JSON（不要其他内容）:
 {{"clarity": X, "conciseness": X, "informativeness": X, "naturalness": X, "overall": X}}"""
 
+# Legacy fake-XML template — DO NOT use for training. Kept only so old callers
+# fail loudly via build_dpo_prompt().
 DPO_PROMPT_TEMPLATE = (
     "<system>你是编程助手。</system>\n"
     "<user>{task_prompt}</user>\n"
@@ -65,6 +67,9 @@ DPO_PROMPT_TEMPLATE = (
     "```\n"
     "请为用户写一段说明："
 )
+
+# Tag stored in filtered DPO jsonl metadata so train_dpo can re-render safely.
+DPO_PROMPT_FORMAT = "qwen_chat_regen_v1"
 
 
 def build_coding_messages(task_prompt: str) -> List[Dict[str, str]]:
@@ -92,10 +97,32 @@ def build_regen_messages(
     ]
 
 
+def build_dpo_messages(
+    task_prompt: str, thinking: str, code: str
+) -> List[Dict[str, str]]:
+    """DPO conditioning messages — identical to regen (collaboration-only)."""
+    return build_regen_messages(task_prompt, thinking, code)
+
+
 def build_dpo_prompt(task_prompt: str, thinking: str, code: str) -> str:
-    """Construct the DPO prompt that conditions on the work trace."""
-    return DPO_PROMPT_TEMPLATE.format(
-        task_prompt=task_prompt,
-        thinking=thinking,
-        code=code,
+    """Deprecated fake-XML string. Raises — use render_dpo_prompt with a tokenizer."""
+    raise RuntimeError(
+        "build_dpo_prompt() produced a fake <system>/<user> XML string that does not "
+        "match Qwen chat templates used at inference/regen. "
+        "Use build_dpo_messages() + apply_chat_template(..., enable_thinking=False), "
+        "or utils.prompts.render_dpo_prompt(tokenizer, ...)."
+    )
+
+
+def render_dpo_prompt(tokenizer, task_prompt: str, thinking: str, code: str) -> str:
+    """Render DPO prompt with the same chat template as regen_collaboration."""
+    from utils.model_utils import apply_chat_template_with_thinking
+
+    messages = build_dpo_messages(task_prompt, thinking, code)
+    return apply_chat_template_with_thinking(
+        tokenizer,
+        messages,
+        enable_thinking=False,
+        add_generation_prompt=True,
+        tokenize=False,
     )

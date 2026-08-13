@@ -114,6 +114,8 @@ python src/collect_traces.py \
 
 Filenames match `run_pipeline.py` (`cycle_N_traces.jsonl`, `cycle_N_raw.jsonl`, `cycle_N_filtered.jsonl`).
 
+DPO pairs store work-trace metadata; `train_dpo.py` re-renders prompts with the **same Qwen chat template** as regen (`enable_thinking=False`). Do not use legacy fake `<system>/<user>` XML prompts.
+
 ```bash
 python src/regen_collaboration.py \
   --base_model ./models/Qwen3-4B \
@@ -132,6 +134,8 @@ python src/train_dpo.py --config configs/dpo_config.yaml \
   --dpo_data ./data/dpo_pairs/cycle_0_filtered.jsonl \
   --output ./checkpoints/cycle_0/model_rl_dpo
 ```
+
+LiveCodeBench eval uses `utils/lcb_executor.py` (stdin + call-based, official-style). Prepared rows have `harness: lcb` and `lcb_tests`, not MBPP asserts.
 
 ## Phase 4 — Full evaluation
 

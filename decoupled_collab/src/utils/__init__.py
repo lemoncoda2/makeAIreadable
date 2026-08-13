@@ -14,9 +14,12 @@ from .prompts import (
     REGEN_USER_TEMPLATE,
     JUDGE_PROMPT,
     DPO_PROMPT_TEMPLATE,
+    DPO_PROMPT_FORMAT,
     build_coding_messages,
     build_regen_messages,
+    build_dpo_messages,
     build_dpo_prompt,
+    render_dpo_prompt,
 )
 from .metrics import (
     parse_readability_score,
@@ -51,9 +54,12 @@ __all__ = [
     "REGEN_USER_TEMPLATE",
     "JUDGE_PROMPT",
     "DPO_PROMPT_TEMPLATE",
+    "DPO_PROMPT_FORMAT",
     "build_coding_messages",
     "build_regen_messages",
+    "build_dpo_messages",
     "build_dpo_prompt",
+    "render_dpo_prompt",
     # metrics
     "parse_readability_score",
     "aggregate_readability_scores",

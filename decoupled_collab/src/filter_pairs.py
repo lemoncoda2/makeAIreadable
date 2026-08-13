@@ -19,7 +19,7 @@ from utils.api_judge import (  # noqa: E402
     judge_collaboration_async,
     mock_judge_scores,
 )
-from utils.prompts import build_dpo_prompt  # noqa: E402
+from utils.prompts import DPO_PROMPT_FORMAT, build_dpo_messages  # noqa: E402
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -37,16 +37,24 @@ def to_dpo_record(
     regen_score: dict[str, float],
     rl_score: dict[str, float],
 ) -> dict[str, Any]:
+    """Store work-trace fields + messages; train_dpo renders Qwen chat template.
+
+    ``prompt`` is intentionally omitted as a final string here — baking fake XML
+    caused train≠inference. train_dpo re-renders from metadata / messages.
+    """
+    task_prompt = pair.get("task_prompt", "")
+    thinking = pair.get("thinking", "")
+    code = pair.get("code", "")
     return {
-        "prompt": build_dpo_prompt(
-            pair.get("task_prompt", ""),
-            pair.get("thinking", ""),
-            pair.get("code", ""),
-        ),
         "chosen": pair.get("regen_collaboration", ""),
         "rejected": pair.get("rl_collaboration", ""),
+        "messages": build_dpo_messages(task_prompt, thinking, code),
         "metadata": {
             "task_id": pair.get("task_id"),
+            "task_prompt": task_prompt,
+            "thinking": thinking,
+            "code": code,
+            "prompt_format": DPO_PROMPT_FORMAT,
             "regen_score": regen_score,
             "rl_score": rl_score,
             "reward": pair.get("reward"),

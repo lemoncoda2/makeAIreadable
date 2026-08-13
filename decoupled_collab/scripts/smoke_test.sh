@@ -58,9 +58,14 @@ eval_tasks = [
 lcb = [
     {
         "task_id": "lcb_smoke_1",
-        "prompt": "Write a function that returns 1.",
-        "test_cases": ["assert solution() == 1"],
-        "code_solution": "def solution():\n    return 1\n",
+        "prompt": "Read two integers and print their sum.",
+        "harness": "lcb",
+        "lcb_tests": [
+            {"type": "stdin", "input": "1 2\n", "output": "3\n"},
+            {"type": "stdin", "input": "0 0\n", "output": "0\n"},
+        ],
+        "test_cases": [],
+        "code_solution": "a,b=map(int,input().split())\nprint(a+b)\n",
         "source": "livecodebench_easy",
         "benchmark": "lcb_easy",
         "synthetic": True,

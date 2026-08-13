@@ -47,11 +47,14 @@ BENCHMARKS: Dict[str, Dict[str, Any]] = {
         "default_path": "data/lcb_easy.jsonl",
         "source_required": "livecodebench_easy",
         "how": (
-            "python src/prepare_data.py --download --require-lcb  "
-            "# or place a real conversion at data/lcb_easy.jsonl"
+            "python src/prepare_data.py --download  "
+            "# stores harness=lcb + lcb_tests (stdin/call); eval uses utils/lcb_executor.py"
         ),
         "min_rows": 20,
-        "description": "Contamination-free secondary eval (easy split only).",
+        "description": (
+            "Contamination-free secondary eval (easy split). "
+            "Requires structured lcb_tests, not MBPP-style asserts."
+        ),
     },
 }
 
@@ -170,6 +173,20 @@ def require_real_benchmark(
         raise ConfigError(
             f"{path} is an example fixture. Copy/prepare real data to {meta['default_path']}."
         )
+
+    # LCB must carry structured harness cases (stdin/call), not assert-only leftovers.
+    if key == "lcb_easy" and not allow_synthetic:
+        from utils.lcb_executor import task_lcb_cases
+
+        full_rows = _read_jsonl(path)
+        ready = sum(1 for r in full_rows if task_lcb_cases(r) or r.get("harness") == "lcb")
+        if ready < max(1, int(0.5 * len(full_rows))):
+            raise ConfigError(
+                f"Benchmark lcb_easy at {path} lacks structured lcb_tests "
+                f"({ready}/{len(full_rows)} ready). Re-run prepare_data.py --download "
+                "so rows include harness='lcb' and stdin/call cases. "
+                "Assert-only MBPP-style fixtures are not valid LiveCodeBench data."
+            )
 
     return info
 

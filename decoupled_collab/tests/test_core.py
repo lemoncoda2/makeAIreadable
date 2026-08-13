@@ -22,7 +22,7 @@ from utils.failfast import ConfigError  # noqa: E402
 from utils.api_judge import filter_pair, mock_judge_scores, parse_json_score  # noqa: E402
 from utils.code_executor import compute_reward, execute_test, separate_output  # noqa: E402
 from utils.metrics import hypothesis_check  # noqa: E402
-from utils.prompts import build_dpo_prompt  # noqa: E402
+from utils.prompts import build_dpo_messages, build_dpo_prompt, build_regen_messages  # noqa: E402
 
 
 def test_extract_function_name_ast():
@@ -65,9 +65,11 @@ def test_parse_json_score_and_filter():
     assert filter_pair(same_a, same_b, threshold=6.0) is False
 
 
-def test_build_dpo_prompt():
-    p = build_dpo_prompt("add numbers", "think", "def add(a,b): return a+b")
-    assert "add numbers" in p and "think" in p and "def add" in p
+def test_build_dpo_messages_match_regen_not_fake_xml():
+    msgs = build_dpo_messages("add numbers", "think", "def add(a,b): return a+b")
+    assert msgs == build_regen_messages("add numbers", "think", "def add(a,b): return a+b")
+    with pytest.raises(RuntimeError, match="fake"):
+        build_dpo_prompt("add numbers", "think", "def add(a,b): return a+b")
 
 
 def test_hypothesis_results():
