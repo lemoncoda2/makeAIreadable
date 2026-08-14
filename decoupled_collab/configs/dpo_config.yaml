@@ -18,11 +18,15 @@ dpo:
   loss_type: sigmoid
   label_smoothing: 0.0
   reference_free: false
+  # Merged Model_RL (base ⊕ GRPO LoRA). DPO trains a *fresh* LoRA on top;
+  # ref_model=None then disables that LoRA → frozen Model_RL (not pretrained base).
+  # Default if null: <rl_adapter>_merged (e.g. checkpoints/cycle_0/model_rl_merged).
+  merged_rl_dir: null
 
 training:
   learning_rate: 5.0e-6
   num_epochs: 3
-  # batch 2 + full ref copy OOMs on V100; PEFT implicit ref + batch 1 is safer.
+  # batch 1 + PEFT implicit ref (on merged Model_RL) fits 32G V100.
   per_device_batch_size: 1
   gradient_accumulation_steps: 8
   max_length: 1536

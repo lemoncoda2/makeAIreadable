@@ -133,6 +133,8 @@ python src/train_dpo.py --config configs/dpo_config.yaml \
   --model ./checkpoints/cycle_0/model_rl \
   --dpo_data ./data/dpo_pairs/cycle_0_filtered.jsonl \
   --output ./checkpoints/cycle_0/model_rl_dpo
+# Internally: merges RL LoRA → model_rl_merged, trains a fresh DPO LoRA on it,
+# ref_model=None ⇒ frozen Model_RL (not pretrained Qwen3-4B).
 ```
 
 LiveCodeBench eval uses `utils/lcb_executor.py` (stdin + call-based, official-style). Prepared rows have `harness: lcb` and `lcb_tests`, not MBPP asserts.
