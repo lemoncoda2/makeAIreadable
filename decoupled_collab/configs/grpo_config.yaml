@@ -24,6 +24,8 @@ grpo:
   # (num_processes * per_device_batch_size) % num_samples_per_prompt == 0.
   # With 4 GPUs × batch 1, 6 is invalid and will fail-fast. Use 4 (or raise batch).
   num_samples_per_prompt: 4
+  thinking_budget_tokens: 256  # force </think>, leave 512 tokens for code
+  stop_after_code_fence: true  # no trailing explanation after runnable code
   max_new_tokens: 768
   temperature: 0.6  # Qwen3 thinking-mode recommendation
   top_p: 0.95  # Qwen3 thinking-mode recommendation
@@ -44,7 +46,8 @@ training:
 
 data:
   train_file: ./data/mbpp_train.jsonl
-  max_tasks: 600
+  # 974 MBPP-full tasks minus the 378 MBPP+ evaluation IDs = 596 disjoint tasks.
+  max_tasks: 596
 
 reward:
   type: code_execution

@@ -132,25 +132,25 @@ echo "==> dry_run collect → regen → filter → evaluate (smoke paths only)"
 
 echo "==> dry_run pipeline single phases"
 "$PYTHON" src/run_pipeline.py \
-  --config configs/pipeline_config.yaml \
+  --config configs/smoke_pipeline_config.yaml \
   --cycle_id 0 \
   --dry_run \
   --only_phase phase1_grpo
 
 "$PYTHON" src/run_pipeline.py \
-  --config configs/pipeline_config.yaml \
+  --config configs/smoke_pipeline_config.yaml \
   --cycle_id 0 \
   --dry_run \
   --only_phase phase2_collect
 
 "$PYTHON" src/run_pipeline.py \
-  --config configs/pipeline_config.yaml \
+  --config configs/smoke_pipeline_config.yaml \
   --cycle_id 0 \
   --dry_run \
   --only_phase phase3_regen
 
 "$PYTHON" src/run_pipeline.py \
-  --config configs/pipeline_config.yaml \
+  --config configs/smoke_pipeline_config.yaml \
   --cycle_id 0 \
   --dry_run \
   --only_phase phase3_filter

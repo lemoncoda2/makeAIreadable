@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional, Sequence
 
-CODING_SYSTEM_PROMPT = (
-    "你是一个双语（中文/English）编程助手。You are a bilingual Chinese/English "
-    "programming assistant.\n"
-    "请使用 thinking mode 进行深入推理：在 <think>...</think> 中完成问题分析、"
-    "算法设计与边界情况检查；然后在回复中用清晰、简洁的语言向用户解释思路，"
-    "并给出可运行的 Python 代码。\n"
-    "Use thinking mode for careful reasoning inside <think>...</think>, then "
-    "explain clearly to the user and provide correct, runnable Python code. "
-    "Prefer the user's language when responding; keep explanations concise and "
-    "actionable."
+CODING_USER_SUFFIX = (
+    "\n\nSolve this as a Python function with the exact interface implied by the "
+    "prompt and examples. Think briefly and choose one approach. End with the "
+    "complete runnable solution in exactly one fenced Python code block; code is "
+    "mandatory and has priority over explanation."
 )
 
 REGEN_SYSTEM_PROMPT = """你是一个AI编程助手的"表达优化师"。
@@ -72,12 +67,24 @@ DPO_PROMPT_TEMPLATE = (
 DPO_PROMPT_FORMAT = "qwen_chat_regen_v1"
 
 
-def build_coding_messages(task_prompt: str) -> List[Dict[str, str]]:
+def build_coding_messages(
+    task_prompt: str,
+    public_test_cases: Optional[Sequence[str]] = None,
+) -> List[Dict[str, str]]:
     """Chat messages for coding generation with thinking mode."""
-    return [
-        {"role": "system", "content": CODING_SYSTEM_PROMPT},
-        {"role": "user", "content": task_prompt},
-    ]
+    # Qwen3 officially uses no default system message. Keeping the coding
+    # contract in the user turn avoids pathological unclosed thinking loops seen
+    # with a custom system role while enable_thinking=True remains explicit in
+    # every caller.
+    content = task_prompt.rstrip()
+    if public_test_cases:
+        public_example = str(public_test_cases[0]).strip()
+        if public_example and public_example not in content:
+            content += (
+                "\n\nRequired public interface example (your definitions must "
+                f"make this assertion executable):\n{public_example}"
+            )
+    return [{"role": "user", "content": content + CODING_USER_SUFFIX}]
 
 
 def build_regen_messages(

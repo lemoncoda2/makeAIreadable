@@ -5,11 +5,12 @@ from .code_executor import (
     compute_reward,
     extract_code,
     execute_test,
+    execute_tests,
     separate_output,
     safe_execute,
 )
 from .prompts import (
-    CODING_SYSTEM_PROMPT,
+    CODING_USER_SUFFIX,
     REGEN_SYSTEM_PROMPT,
     REGEN_USER_TEMPLATE,
     JUDGE_PROMPT,
@@ -46,10 +47,11 @@ __all__ = [
     "compute_reward",
     "extract_code",
     "execute_test",
+    "execute_tests",
     "separate_output",
     "safe_execute",
     # prompts
-    "CODING_SYSTEM_PROMPT",
+    "CODING_USER_SUFFIX",
     "REGEN_SYSTEM_PROMPT",
     "REGEN_USER_TEMPLATE",
     "JUDGE_PROMPT",

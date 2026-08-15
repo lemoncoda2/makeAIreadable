@@ -13,6 +13,7 @@ Synthetic/example fixtures are for `--dry_run` / smoke tests only and must carry
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -191,6 +192,31 @@ def require_real_benchmark(
     return info
 
 
+def require_mbpp_disjoint(train_path: Path, eval_path: Path) -> None:
+    """Fail if any normalized MBPP task ID is used for both training and eval."""
+
+    def numeric_ids(path: Path) -> set[int]:
+        ids: set[int] = set()
+        for row in _read_jsonl(path):
+            match = re.search(r"(\d+)$", str(row.get("task_id", "")))
+            if not match:
+                raise ConfigError(
+                    "Cannot verify MBPP train/eval isolation: unparseable "
+                    f"task_id {row.get('task_id')!r} in {path}"
+                )
+            ids.add(int(match.group(1)))
+        return ids
+
+    overlap = numeric_ids(train_path) & numeric_ids(eval_path)
+    if overlap:
+        raise ConfigError(
+            "MBPP train/eval contamination detected: "
+            f"{len(overlap)} task IDs occur in both {train_path} and {eval_path}; "
+            f"examples={sorted(overlap)[:10]}. Re-run prepare_data.py so MBPP+ "
+            "IDs are excluded from GRPO training."
+        )
+
+
 def require_real_benchmarks(
     root: Path,
     keys: Iterable[str],
@@ -217,4 +243,16 @@ def require_real_benchmarks(
             + "\n\n"
             + list_benchmarks()
         )
+
+    if not allow_synthetic and "mbpp_train" in out and "mbpp_plus" in out:
+        train_path = Path(
+            path_overrides.get("mbpp_train")
+            or (root / BENCHMARKS["mbpp_train"]["default_path"])
+        )
+        eval_path = Path(
+            path_overrides.get("mbpp_plus")
+            or (root / BENCHMARKS["mbpp_plus"]["default_path"])
+        )
+
+        require_mbpp_disjoint(train_path, eval_path)
     return out

@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.venv-prod/
+.venv-data/
+.env
 pipeline_state.json
 data/traces/*.jsonl
 data/dpo_pairs/*.jsonl

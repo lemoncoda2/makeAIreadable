@@ -51,12 +51,12 @@ def pass_at_1(model_output: str, test_cases: list[str], timeout: int = 10) -> bo
     """
     if not test_cases:
         return False
-    from utils.code_executor import execute_test
+    from utils.code_executor import execute_tests
 
     code = extract_code(model_output)
     if not code:
         return False
-    return all(execute_test(code, tc, timeout) for tc in test_cases)
+    return all(execute_tests(code, list(test_cases), timeout))
 
 
 def dry_run_generation(task: dict[str, Any], model_tag: str) -> str:
@@ -93,7 +93,12 @@ def dry_run_generation(task: dict[str, Any], model_tag: str) -> str:
 
 
 class ModelRunner:
-    def __init__(self, model_path: str, base_model_path: Optional[str] = None):
+    def __init__(
+        self,
+        model_path: str,
+        base_model_path: Optional[str] = None,
+        thinking_budget_tokens: int = 256,
+    ):
         from utils.failfast import (
             assert_not_dry_run_placeholder,
             model_input_device,
@@ -140,13 +145,27 @@ class ModelRunner:
                 )
             self.model = base
         self.model.eval()
+        from utils.thinking_budget import install_thinking_budget_generate
+
+        install_thinking_budget_generate(
+            self.model,
+            self.tokenizer,
+            thinking_budget_tokens=thinking_budget_tokens,
+            stop_after_code_fence=True,
+        )
         self._apply = apply_chat_template_with_thinking
         self._device = model_input_device(self.model)
 
-    def generate(self, prompt: str, max_new_tokens: int = 768, temperature: float = 0.2) -> str:
+    def generate(
+        self,
+        prompt: str,
+        public_test_cases: Optional[list[str]] = None,
+        max_new_tokens: int = 768,
+        temperature: float = 0.2,
+    ) -> str:
         import torch
 
-        messages = build_coding_messages(prompt)
+        messages = build_coding_messages(prompt, public_test_cases)
         text = self._apply(self.tokenizer, messages, enable_thinking=True)
         inputs = self.tokenizer(text, return_tensors="pt")
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
@@ -243,6 +262,8 @@ def generate_for_model(
     tasks: list[dict[str, Any]],
     *,
     dry_run: bool,
+    max_new_tokens: int = 768,
+    thinking_budget_tokens: int = 256,
 ) -> list[str]:
     if dry_run:
         return [dry_run_generation(t, model_tag) for t in tasks]
@@ -252,9 +273,20 @@ def generate_for_model(
             "Refusing to inject ground-truth dry_run_generation stubs outside --dry_run "
             "(that would fake pass@1 / readability)."
         )
-    runner = ModelRunner(model_path, base_model_path=base_model_path)
+    runner = ModelRunner(
+        model_path,
+        base_model_path=base_model_path,
+        thinking_budget_tokens=thinking_budget_tokens,
+    )
     try:
-        return [runner.generate(t["prompt"]) for t in tasks]
+        return [
+            runner.generate(
+                t["prompt"],
+                (t.get("test_cases") or [])[:1],
+                max_new_tokens=max_new_tokens,
+            )
+            for t in tasks
+        ]
     finally:
         # Free VRAM before loading the next model tag (base → rl → final).
         del runner
@@ -281,6 +313,8 @@ def evaluate_model(
     mock_judge: bool,
     num_tasks_benchmark: int,
     num_tasks_readability: int,
+    max_new_tokens: int = 768,
+    thinking_budget_tokens: int = 256,
 ) -> dict[str, Any]:
     bench_tasks = mbpp_tasks[:num_tasks_benchmark]
     read_tasks = mbpp_tasks[:num_tasks_readability]
@@ -292,7 +326,13 @@ def evaluate_model(
 
     if need_bench:
         outs = generate_for_model(
-            model_tag, model_path, base_model_path, bench_tasks, dry_run=dry_run
+            model_tag,
+            model_path,
+            base_model_path,
+            bench_tasks,
+            dry_run=dry_run,
+            max_new_tokens=max_new_tokens,
+            thinking_budget_tokens=thinking_budget_tokens,
         )
         mbpp = evaluate_benchmark(bench_tasks, outs)
         result["mbpp_plus_pass1"] = mbpp["pass_at_1"]
@@ -310,7 +350,13 @@ def evaluate_model(
                     "Do not use assert-only fixtures for LCB."
                 )
             lcb_outs = generate_for_model(
-                model_tag, model_path, base_model_path, lcb_eval, dry_run=dry_run
+                model_tag,
+                model_path,
+                base_model_path,
+                lcb_eval,
+                dry_run=dry_run,
+                max_new_tokens=max_new_tokens,
+                thinking_budget_tokens=thinking_budget_tokens,
             )
             lcb = evaluate_benchmark(lcb_eval, lcb_outs)
             result["lcb_easy_pass1"] = lcb["pass_at_1"]
@@ -320,7 +366,13 @@ def evaluate_model(
 
     if need_read:
         outs = generate_for_model(
-            model_tag, model_path, base_model_path, read_tasks, dry_run=dry_run
+            model_tag,
+            model_path,
+            base_model_path,
+            read_tasks,
+            dry_run=dry_run,
+            max_new_tokens=max_new_tokens,
+            thinking_budget_tokens=thinking_budget_tokens,
         )
         read = evaluate_readability(
             read_tasks, outs, mock_judge=mock_judge, model_tag=model_tag
@@ -354,6 +406,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--num_tasks", type=int, default=None, help="Alias for both caps")
     parser.add_argument("--num_tasks_benchmark", type=int, default=200)
     parser.add_argument("--num_tasks_readability", type=int, default=50)
+    parser.add_argument("--max_new_tokens", type=int, default=768)
+    parser.add_argument("--thinking_budget_tokens", type=int, default=256)
     parser.add_argument("--judge_api", default="deepseek")
     parser.add_argument("--mock_judge", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
@@ -369,6 +423,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.num_tasks is not None:
         args.num_tasks_benchmark = args.num_tasks
         args.num_tasks_readability = min(args.num_tasks, args.num_tasks_readability)
+    if not 0 < args.thinking_budget_tokens < args.max_new_tokens:
+        raise SystemExit(
+            "[error] --thinking_budget_tokens must be positive and smaller than "
+            f"--max_new_tokens; got {args.thinking_budget_tokens} and "
+            f"{args.max_new_tokens}"
+        )
 
     # mock_judge only when explicitly requested — dry_run alone must not imply
     # fake readability scores unless --mock_judge / --judge_api mock is set.
@@ -448,6 +508,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             mock_judge=mock_judge,
             num_tasks_benchmark=args.num_tasks_benchmark,
             num_tasks_readability=args.num_tasks_readability,
+            max_new_tokens=args.max_new_tokens,
+            thinking_budget_tokens=args.thinking_budget_tokens,
         )
 
     payload = summarize_eval_results(cycle=args.cycle, models=models_out)

@@ -18,7 +18,7 @@ batch/generations mismatch). Prefer a loud error over a fake success.
 | Python | 3.11 |
 | PyTorch | `2.5.1+cu121` or `2.6.0+cu124` (FP16 only) |
 | transformers | `>=4.51,<4.53` (Qwen3 hard requirement) |
-| trl / peft / accelerate | `0.15.2` / `0.14.0` / `1.2.1` |
+| trl / peft / accelerate | `0.15.2` / `0.14.0` / `1.6.0` |
 | vLLM (optional) | **`0.8.5`** + `VLLM_USE_V1=0` (Qwen3 ∩ V100 sm_70); skip if wheel fails |
 
 ```bash
@@ -36,9 +36,17 @@ Details and rationale: `GOAL.md` Step 0.2 / root `GOAL_decoupled_collaboration.m
 | `mbpp_plus` | Primary eval | **EvalPlus MBPP+** | `data/mbpp_plus_test.jsonl` |
 | `lcb_easy` | Secondary eval | LiveCodeBench **easy** | `data/lcb_easy.jsonl` |
 
+Data preparation merges all 974 MBPP-full splits, then removes every numeric
+task ID present in MBPP+ before writing the GRPO set. With the current EvalPlus
+release this yields 596 training tasks and 378 disjoint evaluation tasks.
+The real pipeline refuses any train/eval ID overlap.
+
 ```bash
 python src/prepare_data.py --list-benchmarks
 python src/prepare_data.py --download   # network required
+# Avoid the multi-GB LCB release_latest fetch when a raw shard is already local:
+python src/prepare_data.py --skip-train --skip-mbpp-plus \
+  --lcb-source-jsonl /path/to/test.jsonl
 # train / evaluate / run_pipeline (non-dry-run) refuse synthetic/empty/wrong-source files
 ```
 
@@ -178,5 +186,6 @@ Pipeline state is stored in `pipeline_state.json` under the project root. Phases
 ## Notes
 
 - **GPU training** (`train_grpo.py` / `train_dpo.py`) is expected on the V100 server; this repo’s orchestration + data scripts support `--dry_run` for CI/agent validation without GPUs.
-- LiveCodeBench easy may ship as an empty placeholder until downloaded manually — see `prepare_lcb_easy()` warnings.
+- LiveCodeBench easy must be prepared before a real full evaluation; the
+  fail-fast validator refuses missing, empty, or synthetic placeholder data.
 - See `GOAL.md` for success criteria, timelines, and failure recovery.

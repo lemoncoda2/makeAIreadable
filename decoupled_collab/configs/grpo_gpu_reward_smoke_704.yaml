@@ -1,0 +1,54 @@
+model:
+  name_or_path: ./models/Qwen3-4B
+  torch_dtype: float16
+  enable_thinking: true
+
+output_dir: ./checkpoints/gpu_reward_smoke_704/model_rl
+
+lora:
+  rank: 8
+  alpha: 16
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  dropout: 0.05
+
+grpo:
+  num_samples_per_prompt: 4
+  thinking_budget_tokens: 256
+  stop_after_code_fence: true
+  max_new_tokens: 704
+  temperature: 0.6
+  top_p: 0.95
+  kl_coeff: 0.04
+  clip_range: 0.2
+  normalize_reward: true
+
+training:
+  learning_rate: 2.0e-5
+  num_epochs: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  warmup_ratio: 0.0
+  max_grad_norm: 1.0
+  fp16: true
+  dataloader_num_workers: 0
+
+data:
+  train_file: ./data/mbpp_train.jsonl
+  max_tasks: 4
+
+reward:
+  type: code_execution
+  timeout: 10
+  max_test_cases: 5
+
+logging:
+  log_every_n_steps: 1
+  save_every_n_steps: 10
+  wandb_run: gpu-reward-smoke-704

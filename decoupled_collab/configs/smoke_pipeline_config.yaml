@@ -1,0 +1,26 @@
+general:
+  base_model: ./models/Qwen3-4B
+  num_cycles: 1
+  project_root: .
+  num_gpus: 4
+  checkpoint_root: ./checkpoints/smoke
+  log_root: ./logs/smoke
+  trace_root: ./data/smoke/traces
+  dpo_pairs_root: ./data/smoke/dpo_pairs
+  results_root: ./data/smoke/results
+  state_file: ./data/smoke/pipeline_state.json
+grpo:
+  config: configs/grpo_config.yaml
+  train_file: ./data/smoke/mbpp_train.jsonl
+  num_tasks_collect: 2
+dpo:
+  config: configs/dpo_config.yaml
+  threshold: 6.0
+  min_pairs: 1
+inference:
+  use_vllm: false
+eval:
+  num_tasks_benchmark: 1
+  num_tasks_readability: 1
+  mbpp_plus: ./data/smoke/mbpp_plus_test.jsonl
+  lcb_easy: ./data/smoke/lcb_easy.jsonl

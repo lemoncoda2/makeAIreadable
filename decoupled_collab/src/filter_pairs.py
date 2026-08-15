@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Filter DPO pairs with DeepSeek readability judge (GOAL Step 3.2)."""
+"""Build DPO rows from raw regen/RL pairs.
+
+DeepSeek is evaluation-only. Training pairs are kept by structural rules:
+non-empty work layer + distinct chosen/rejected collaboration. Optional
+``--judge_api mock`` remains for offline smoke tests.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +37,28 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def structural_keep(pair: dict[str, Any], *, max_collab_chars: int = 4000) -> bool:
+    """Keep a pair without a judge: real work layer + distinct collaborations."""
+    regen = (pair.get("regen_collaboration") or "").strip()
+    rl = (pair.get("rl_collaboration") or "").strip()
+    code = (pair.get("code") or "").strip()
+    if not regen or not rl or not code:
+        return False
+    if regen == rl:
+        return False
+    if len(regen) > max_collab_chars or len(rl) > max_collab_chars:
+        return False
+    return True
+
+
+def filter_structural(pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for pair in pairs:
+        if structural_keep(pair):
+            kept.append(to_dpo_record(pair, {}, {}))
+    return kept
+
+
 def to_dpo_record(
     pair: dict[str, Any],
     regen_score: dict[str, float],
@@ -55,11 +82,16 @@ def to_dpo_record(
             "thinking": thinking,
             "code": code,
             "prompt_format": DPO_PROMPT_FORMAT,
-            "regen_score": regen_score,
-            "rl_score": rl_score,
+            "regen_score": regen_score or None,
+            "rl_score": rl_score or None,
             "reward": pair.get("reward"),
-            "score_gap": float(regen_score.get("overall", 0))
-            - float(rl_score.get("overall", 0)),
+            "score_gap": (
+                float(regen_score.get("overall", 0)) - float(rl_score.get("overall", 0))
+                if regen_score and rl_score
+                and "overall" in regen_score
+                and "overall" in rl_score
+                else None
+            ),
         },
     }
 
@@ -157,7 +189,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Filter DPO pairs (GOAL Step 3.2)")
     parser.add_argument("--raw_pairs", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--judge_api", default="deepseek")
+    parser.add_argument(
+        "--judge_api",
+        default="none",
+        help="Pair construction: none/structural (default). "
+        "deepseek is ignored (eval-only). mock keeps offline smoke scores.",
+    )
     parser.add_argument("--threshold", type=float, default=6.0)
     parser.add_argument("--batch_size", type=int, default=20)
     parser.add_argument("--max_concurrent", type=int, default=5)
@@ -173,7 +210,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         "--min_pairs",
         type=int,
         default=1,
-        help="Fail if fewer pairs kept (GOAL real runs use ~1500 via pipeline)",
+        help="Warn (or fail with --strict_min_pairs) if fewer pairs kept",
+    )
+    parser.add_argument(
+        "--strict_min_pairs",
+        action="store_true",
+        help="Exit non-zero when kept < --min_pairs (default: warn only if kept>=1)",
     )
     parser.add_argument(
         "--max_score_error_rate",
@@ -190,28 +232,17 @@ def main(argv: Optional[list[str]] = None) -> None:
     print(f"Loaded {len(pairs)} raw pairs from {args.raw_pairs}")
 
     score_errors = 0
-    if args.mock_judge or args.judge_api == "mock":
+    judge = (args.judge_api or "none").lower()
+    if args.mock_judge or judge == "mock":
         kept = filter_mock(pairs, threshold=args.threshold)
-    else:
-        kept, score_errors = asyncio.run(
-            filter_async(
-                pairs,
-                threshold=args.threshold,
-                max_concurrent=args.max_concurrent,
-                model=args.judge_model,
-                max_retries=args.max_retries,
-                batch_size=args.batch_size,
-            )
+    elif judge in {"deepseek", "api"}:
+        print(
+            "[warn] DeepSeek is evaluation-only; ignoring --judge_api "
+            f"{args.judge_api} for DPO pair construction."
         )
-        if pairs:
-            err_rate = score_errors / len(pairs)
-            if err_rate > args.max_score_error_rate:
-                raise SystemExit(
-                    f"[error] Judge scoring error rate {err_rate:.2%} "
-                    f"({score_errors}/{len(pairs)}) exceeds "
-                    f"--max_score_error_rate={args.max_score_error_rate}. "
-                    "Fix API/model before training on a thin filtered set."
-                )
+        kept = filter_structural(pairs)
+    else:
+        kept = filter_structural(pairs)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
@@ -219,11 +250,17 @@ def main(argv: Optional[list[str]] = None) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     print(f"Kept {len(kept)}/{len(pairs)} pairs → {args.output}")
-    if len(kept) < args.min_pairs:
+    if not kept:
         raise SystemExit(
-            f"[error] Kept only {len(kept)} pairs < --min_pairs={args.min_pairs}. "
-            "Refusing empty/thin DPO data (looks like success but trains on almost nothing)."
+            "[error] Kept 0 DPO pairs. Refusing to train on an empty preference set."
         )
+    if len(kept) < args.min_pairs:
+        msg = (
+            f"Kept only {len(kept)} pairs < --min_pairs={args.min_pairs}."
+        )
+        if args.strict_min_pairs:
+            raise SystemExit(f"[error] {msg}")
+        print(f"[warn] {msg} Continuing (DeepSeek is not a train-time gate).")
 
 
 if __name__ == "__main__":

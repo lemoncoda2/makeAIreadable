@@ -16,6 +16,7 @@ from utils.failfast import (  # noqa: E402
     ConfigError,
     assert_not_adapter_for_vllm,
     assert_not_dry_run_placeholder,
+    resolve_trainer_resume_checkpoint,
     validate_grpo_batch_vs_generations,
 )
 from utils.model_utils import apply_chat_template_with_thinking  # noqa: E402
@@ -52,6 +53,27 @@ def test_vllm_adapter_refused(tmp_path):
     (d / "adapter_config.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ConfigError, match="PEFT/LoRA"):
         assert_not_adapter_for_vllm(d)
+
+
+def test_auto_resume_chooses_highest_valid_trainer_checkpoint(tmp_path):
+    output = tmp_path / "model_rl"
+    for name in ("checkpoint-2", "checkpoint-10", "checkpoint-bad"):
+        (output / name).mkdir(parents=True)
+    (output / "checkpoint-2" / "trainer_state.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (output / "checkpoint-10" / "trainer_state.json").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    resolved = resolve_trainer_resume_checkpoint("auto", output)
+
+    assert resolved == (output / "checkpoint-10").resolve()
+
+
+def test_auto_resume_refuses_silent_fresh_restart(tmp_path):
+    with pytest.raises(ConfigError, match="Refusing to silently start over"):
+        resolve_trainer_resume_checkpoint("auto", tmp_path / "model_rl")
 
 
 def test_parse_json_score_empty_fails():

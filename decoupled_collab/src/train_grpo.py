@@ -9,6 +9,7 @@ Reward is code-execution only (see utils.code_executor.compute_reward).
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -18,7 +19,7 @@ from typing import Any, Dict, List, Optional
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from utils.code_executor import compute_reward  # noqa: E402
+from utils.code_executor import batch_compute_rewards  # noqa: E402
 from utils.model_utils import (  # noqa: E402
     apply_chat_template_with_thinking,
     build_lora_config,
@@ -32,6 +33,173 @@ from utils.model_utils import (  # noqa: E402
     setup_wandb_env,
 )
 from utils.prompts import build_coding_messages  # noqa: E402
+
+
+def get_compatible_grpo_trainer_class(base_trainer: type) -> type:
+    """Bridge the TRL 0.15 sampler signature to Transformers 4.52.
+
+    Transformers 4.52 calls ``_get_train_sampler(train_dataset)`` while TRL
+    0.15.2 overrides it as ``_get_train_sampler()``.  Keep the workaround
+    narrowly signature-gated so an unknown future API fails instead of being
+    silently papered over.
+    """
+    method = base_trainer._get_train_sampler
+    parameters = list(inspect.signature(method).parameters.values())
+    names = [parameter.name for parameter in parameters]
+
+    if names == ["self"]:
+        class CompatibleGRPOTrainer(base_trainer):
+            def _get_train_sampler(self, train_dataset=None):
+                if train_dataset is None or train_dataset is self.train_dataset:
+                    return super()._get_train_sampler()
+
+                # The legacy TRL implementation reads self.train_dataset.
+                # Temporarily point it at the dataset prepared by Transformers
+                # so its RepeatRandomSampler is built for the correct rows.
+                original_dataset = self.train_dataset
+                self.train_dataset = train_dataset
+                try:
+                    return super()._get_train_sampler()
+                finally:
+                    self.train_dataset = original_dataset
+
+        CompatibleGRPOTrainer.__name__ = f"Compatible{base_trainer.__name__}"
+        return CompatibleGRPOTrainer
+
+    if names[:2] == ["self", "train_dataset"]:
+        return base_trainer
+
+    raise RuntimeError(
+        "Unsupported GRPOTrainer._get_train_sampler signature: "
+        f"{inspect.signature(method)}"
+    )
+
+
+def get_thinking_budget_grpo_trainer_class(
+    base_trainer: type,
+    thinking_budget_tokens: int,
+    stop_after_code_fence: bool = False,
+) -> type:
+    """Add forced Qwen think-close generation and mask its control token."""
+    if thinking_budget_tokens <= 0:
+        raise ValueError("thinking_budget_tokens must be positive")
+
+    class ThinkingBudgetGRPOTrainer(base_trainer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            from utils.thinking_budget import install_thinking_budget_generate
+
+            self._decoupled_think_end_token_id = install_thinking_budget_generate(
+                self.model,
+                self.processing_class,
+                thinking_budget_tokens=thinking_budget_tokens,
+                stop_after_code_fence=stop_after_code_fence,
+            )
+
+        def _prepare_inputs(self, inputs):
+            prepared = super()._prepare_inputs(inputs)
+            completion_ids = prepared["completion_ids"]
+            completion_mask = prepared["completion_mask"]
+            if stop_after_code_fence:
+                from utils.thinking_budget import mask_completion_after_code_fence
+
+                completion_mask = mask_completion_after_code_fence(
+                    completion_ids,
+                    completion_mask,
+                    self.processing_class,
+                )
+                prepared["completion_mask"] = completion_mask
+            loss_mask = completion_mask.clone()
+            forced_index = thinking_budget_tokens
+            if completion_ids.shape[1] > forced_index:
+                forced_close = completion_ids[:, forced_index].eq(
+                    self._decoupled_think_end_token_id
+                )
+                if bool(forced_close.any()):
+                    loss_mask[forced_close, forced_index] = 0
+            # Do not alter completion_mask: TRL also uses it as the attention
+            # mask. The generated code must still attend to the forced </think>.
+            prepared["decoupled_loss_mask"] = loss_mask
+            return prepared
+
+        def compute_loss(
+            self,
+            model,
+            inputs,
+            return_outputs=False,
+            num_items_in_batch=None,
+        ):
+            if return_outputs:
+                raise ValueError(
+                    "The GRPOTrainer does not support returning outputs"
+                )
+
+            import torch
+
+            prompt_ids = inputs["prompt_ids"]
+            prompt_mask = inputs["prompt_mask"]
+            completion_ids = inputs["completion_ids"]
+            completion_mask = inputs["completion_mask"]
+            loss_mask = inputs["decoupled_loss_mask"]
+            input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+            logits_to_keep = completion_ids.size(1)
+            per_token_logps = self._get_per_token_logps(
+                model, input_ids, attention_mask, logits_to_keep
+            )
+
+            loss, per_token_kl = compute_masked_grpo_objective(
+                per_token_logps=per_token_logps,
+                ref_per_token_logps=inputs["ref_per_token_logps"],
+                advantages=inputs["advantages"],
+                loss_mask=loss_mask,
+                beta=self.beta,
+            )
+
+            completion_length = (
+                self.accelerator.gather_for_metrics(completion_mask.sum(1))
+                .float()
+                .mean()
+                .item()
+            )
+            self._metrics["completion_length"].append(completion_length)
+            mean_kl = (
+                (per_token_kl * loss_mask).sum(dim=1)
+                / loss_mask.sum(dim=1).clamp_min(1)
+            ).mean()
+            self._metrics["kl"].append(
+                self.accelerator.gather_for_metrics(mean_kl).mean().item()
+            )
+            return loss
+
+    ThinkingBudgetGRPOTrainer.__name__ = (
+        f"ThinkingBudget{base_trainer.__name__}"
+    )
+    return ThinkingBudgetGRPOTrainer
+
+
+def compute_masked_grpo_objective(
+    *, per_token_logps, ref_per_token_logps, advantages, loss_mask, beta
+):
+    """TRL 0.15 GRPO objective with a separate mask for forced tokens."""
+    import torch
+
+    active = loss_mask.bool()
+    # Compute KL in FP32 and zero inactive log-ratios before exp. Multiplying
+    # an already-overflowed value by zero would still produce NaN.
+    log_ratio = (ref_per_token_logps - per_token_logps).float()
+    log_ratio = torch.where(active, log_ratio, torch.zeros_like(log_ratio))
+    per_token_kl = torch.exp(log_ratio) - log_ratio - 1
+
+    policy_ratio = torch.exp(
+        per_token_logps.float() - per_token_logps.float().detach()
+    )
+    per_token_loss = -(
+        policy_ratio * advantages.float().unsqueeze(1) - float(beta) * per_token_kl
+    )
+    denominator = loss_mask.sum(dim=1).clamp_min(1)
+    loss = ((per_token_loss * loss_mask).sum(dim=1) / denominator).mean()
+    return loss, per_token_kl
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +222,16 @@ def parse_args() -> argparse.Namespace:
         "--dry_run",
         action="store_true",
         help="Load config, print plan, exit without training",
+    )
+    p.add_argument(
+        "--resume_from_checkpoint",
+        nargs="?",
+        const="auto",
+        default=None,
+        help=(
+            "Resume from an explicit Trainer checkpoint directory, or use without "
+            "a value to select the highest valid checkpoint-N under output_dir"
+        ),
     )
     return p.parse_args()
 
@@ -102,7 +280,7 @@ def load_grpo_dataset(
             test_cases = item.get("test_cases") or item.get("test_list") or []
             task_id = item.get("task_id", f"task_{len(rows)}")
 
-            messages = build_coding_messages(task_prompt)
+            messages = build_coding_messages(task_prompt, test_cases[:1])
             rendered = apply_chat_template_with_thinking(
                 tokenizer,
                 messages,
@@ -127,7 +305,11 @@ def load_grpo_dataset(
     return Dataset.from_list(rows)
 
 
-def build_reward_func(timeout: int = 10, max_test_cases: int = 5):
+def build_reward_func(
+    timeout: int = 10,
+    max_test_cases: int = 5,
+    audit_dir: Optional[Path] = None,
+):
     """
     TRL GRPO reward callable.
 
@@ -136,7 +318,10 @@ def build_reward_func(timeout: int = 10, max_test_cases: int = 5):
     Extra dataset columns (e.g. test_cases) are passed via kwargs.
     """
 
+    audit_call = 0
+
     def reward_func(completions=None, test_cases=None, **kwargs):
+        nonlocal audit_call
         # Some TRL versions pass prompts as first positional; accept both.
         if completions is None:
             completions = kwargs.get("completions", [])
@@ -155,6 +340,7 @@ def build_reward_func(timeout: int = 10, max_test_cases: int = 5):
                 f"{sorted(kwargs.keys())}"
             )
         tcs_batch = list(test_cases)
+        task_ids = list(kwargs.get("task_id") or [None] * len(tcs_batch))
         if len(tcs_batch) != n:
             # TRL GRPO expands each prompt into num_generations completions.
             # Common layout: completions grouped per prompt, so n = len(tcs) * G.
@@ -164,6 +350,7 @@ def build_reward_func(timeout: int = 10, max_test_cases: int = 5):
                 for tc in tcs_batch:
                     expanded.extend([tc] * repeat)
                 tcs_batch = expanded
+                task_ids = [task_id for task_id in task_ids for _ in range(repeat)]
                 print(
                     f"[info] Expanded test_cases x{repeat} to match "
                     f"{n} completions (GRPO num_generations alignment)"
@@ -176,8 +363,14 @@ def build_reward_func(timeout: int = 10, max_test_cases: int = 5):
                     "Refusing to invent alignment."
                 )
 
-        rewards = []
-        for text, tcs in zip(texts, tcs_batch):
+        if len(task_ids) != n:
+            raise RuntimeError(
+                f"GRPO audit alignment mismatch: len(task_ids)={len(task_ids)} "
+                f"but len(completions)={n}."
+            )
+
+        parsed_tcs: list = []
+        for tcs in tcs_batch:
             if isinstance(tcs, str):
                 try:
                     tcs = json.loads(tcs)
@@ -190,16 +383,40 @@ def build_reward_func(timeout: int = 10, max_test_cases: int = 5):
                     "Encountered test_cases=None for a completion. "
                     "Every GRPO row must include a list of assert tests."
                 )
-            rewards.append(
-                float(
-                    compute_reward(
-                        text,
-                        list(tcs),
-                        timeout=timeout,
-                        max_test_cases=max_test_cases,
-                    )
-                )
+            parsed_tcs.append(list(tcs))
+
+        rewards = [
+            float(r)
+            for r in batch_compute_rewards(
+                texts,
+                parsed_tcs,
+                timeout=timeout,
+                max_test_cases=max_test_cases,
             )
+        ]
+
+        if audit_dir is not None:
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+            audit_path = audit_dir / f"reward_rank{rank}.jsonl"
+            with audit_path.open("a", encoding="utf-8") as audit_file:
+                for task_id, text, reward in zip(task_ids, texts, rewards):
+                    audit_file.write(
+                        json.dumps(
+                            {
+                                "call": audit_call,
+                                "task_id": task_id,
+                                "reward": reward,
+                                "has_think_end": "</think>" in text,
+                                "has_python_fence": "```python" in text.lower(),
+                                "completion_chars": len(text),
+                                "completion": text,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            audit_call += 1
         return rewards
 
     reward_func.__name__ = "code_execution_reward"
@@ -238,6 +455,7 @@ def build_grpo_config(cfg: Dict[str, Any], output_dir: Path, report_to: str):
         report_to=report_to,
         remove_unused_columns=False,  # keep test_cases for reward_func
         dataloader_num_workers=int(training.get("dataloader_num_workers", 0)),
+        ddp_find_unused_parameters=False,
         # GRPO-specific (names vary slightly across TRL versions)
         num_generations=int(grpo.get("num_samples_per_prompt", 6)),
         max_completion_length=int(grpo.get("max_new_tokens", 768)),
@@ -351,6 +569,21 @@ def main() -> int:
     }
     print_plan(cfg, args, paths)
 
+    from utils.failfast import ConfigError, resolve_trainer_resume_checkpoint
+
+    resume_requested = args.resume_from_checkpoint
+    if resume_requested is None:
+        resume_requested = cfg.get("training", {}).get("resume_from_checkpoint")
+    try:
+        resume_checkpoint = resolve_trainer_resume_checkpoint(
+            resume_requested, output_dir, root=ROOT
+        )
+    except ConfigError as e:
+        print(f"[error] {e}")
+        return 1
+    if resume_checkpoint is not None:
+        print(f"[info] Will resume Trainer state from {resume_checkpoint}")
+
     if args.dry_run:
         # Still validate known-broken GRPO math so dry-run surfaces config bugs.
         from utils.failfast import validate_grpo_batch_vs_generations
@@ -394,7 +627,7 @@ def main() -> int:
 
     # Import TRL early with a clear message
     try:
-        from trl import GRPOTrainer, GRPOConfig  # noqa: F401
+        from trl import GRPOTrainer as TRLGRPOTrainer, GRPOConfig  # noqa: F401
     except ImportError as e:
         print(
             "[error] Cannot import GRPOTrainer/GRPOConfig. "
@@ -403,13 +636,41 @@ def main() -> int:
         print(f"        Detail: {e}")
         return 1
 
+    try:
+        GRPOTrainer = get_compatible_grpo_trainer_class(TRLGRPOTrainer)
+    except RuntimeError as e:
+        print(f"[error] {e}")
+        return 1
+
+    thinking_budget_tokens = cfg.get("grpo", {}).get("thinking_budget_tokens")
+    if thinking_budget_tokens is not None:
+        thinking_budget_tokens = int(thinking_budget_tokens)
+        max_completion_length = int(
+            cfg.get("grpo", {}).get("max_new_tokens", 768)
+        )
+        if not bool(cfg.get("model", {}).get("enable_thinking", True)):
+            print("[error] thinking_budget_tokens requires enable_thinking=True")
+            return 1
+        if not 0 < thinking_budget_tokens < max_completion_length:
+            print(
+                "[error] thinking_budget_tokens must be positive and smaller "
+                f"than max_new_tokens; got {thinking_budget_tokens} and "
+                f"{max_completion_length}"
+            )
+            return 1
+        GRPOTrainer = get_thinking_budget_grpo_trainer_class(
+            GRPOTrainer,
+            thinking_budget_tokens,
+            stop_after_code_fence=bool(
+                cfg.get("grpo", {}).get("stop_after_code_fence", False)
+            ),
+        )
+
     if not train_file.exists():
         print(f"[error] Training data not found: {train_file}")
         return 1
 
     from utils.benchmarks import require_real_benchmark
-    from utils.failfast import ConfigError
-
     try:
         require_real_benchmark("mbpp_train", train_file, allow_synthetic=False)
     except ConfigError as e:
@@ -464,6 +725,7 @@ def main() -> int:
     reward_fn = build_reward_func(
         timeout=int(reward_cfg.get("timeout", 10)),
         max_test_cases=int(reward_cfg.get("max_test_cases", 5)),
+        audit_dir=output_dir / "reward_audit",
     )
 
     grpo_args = build_grpo_config(cfg, output_dir, report_to=report_to)
@@ -500,17 +762,32 @@ def main() -> int:
             ) from e
 
     print("[info] Starting GRPO training...")
-    trainer.train()
+    trainer.train(
+        resume_from_checkpoint=(
+            str(resume_checkpoint) if resume_checkpoint is not None else None
+        )
+    )
 
-    print(f"[info] Saving LoRA adapter to {output_dir}")
-    trainer.save_model(str(output_dir))
-    tokenizer.save_pretrained(str(output_dir))
-    # Ensure peft adapter files exist even if trainer saved full wrapper
-    unwrapped = trainer.model
-    if hasattr(unwrapped, "save_pretrained"):
-        unwrapped.save_pretrained(str(output_dir))
+    trainer.accelerator.wait_for_everyone()
+    if trainer.accelerator.is_main_process:
+        print(f"[info] Saving LoRA adapter to {output_dir}")
+        trainer.save_model(str(output_dir))
+        tokenizer.save_pretrained(str(output_dir))
+        required_adapter_files = (
+            output_dir / "adapter_config.json",
+            output_dir / "adapter_model.safetensors",
+        )
+        missing = [str(path) for path in required_adapter_files if not path.is_file()]
+        if missing:
+            raise RuntimeError(
+                "GRPO completed but the LoRA adapter save is incomplete: "
+                + ", ".join(missing)
+            )
 
-    print("[info] GRPO training finished.")
+    trainer.accelerator.wait_for_everyone()
+    trainer.accelerator.end_training()
+    if trainer.accelerator.is_main_process:
+        print("[info] GRPO training finished.")
     return 0
 
 

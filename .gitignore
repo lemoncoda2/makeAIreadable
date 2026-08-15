@@ -1,0 +1,4 @@
+*.tgz
+.deploy-*
+server-backup*
+hf_cache/

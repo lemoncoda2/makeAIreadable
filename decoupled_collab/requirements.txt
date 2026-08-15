@@ -16,10 +16,10 @@
 transformers>=4.51.0,<4.53
 trl==0.15.2
 peft==0.14.0
-accelerate==1.2.1
+# Transformers 4.52 calls Accelerator.unwrap_model(keep_torch_compile=...).
+# That public argument is present in Accelerate 1.6.0, but not 1.2.1.
+accelerate==1.6.0
 datasets==3.2.0
-bitsandbytes==0.45.0
-deepspeed==0.15.4
 openai>=1.40.0
 evalplus
 wandb
@@ -29,6 +29,11 @@ pyyaml>=6.0
 tqdm
 pytest>=7.0
 huggingface_hub
+# uv-created virtualenvs do not seed setuptools; keep it available for legacy
+# runtime imports and optional native-extension builds.
+setuptools>=74.1.1,<81
 
 # Optional inference accelerator (Qwen3 + V100 intersection):
 # vllm==0.8.5
+# Optional training engine (the default Accelerate/DDP configs do not use it):
+# deepspeed==0.15.4

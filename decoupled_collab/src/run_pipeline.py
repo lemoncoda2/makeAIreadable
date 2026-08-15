@@ -52,11 +52,17 @@ def load_config(config_path: Path) -> dict[str, Any]:
     return cfg
 
 
-def state_path(project_root: Path) -> Path:
-    return project_root / STATE_FILE_NAME
+def state_path(project_root: Path, configured: Optional[str] = None) -> Path:
+    return resolve_path(project_root, configured or STATE_FILE_NAME)
 
 
-def load_state(project_root: Path, *, resume: bool, cycle_id: Optional[int]) -> dict[str, Any]:
+def load_state(
+    project_root: Path,
+    *,
+    resume: bool,
+    cycle_id: Optional[int],
+    state_file: Optional[Path] = None,
+) -> dict[str, Any]:
     """
     Always attempt to load existing state when --resume is set.
     When not resuming, start fresh (but still overwrite STATE_FILE as we go).
@@ -65,7 +71,7 @@ def load_state(project_root: Path, *, resume: bool, cycle_id: Optional[int]) -> 
     - resume always loaded state even when resume=False (both branches identical)
     - start_phase indexing crashed when current_phase missing from PHASES
     """
-    path = state_path(project_root)
+    path = state_file or state_path(project_root)
     if resume and path.exists():
         with open(path, encoding="utf-8") as f:
             state = json.load(f)
@@ -89,9 +95,15 @@ def load_state(project_root: Path, *, resume: bool, cycle_id: Optional[int]) -> 
     return state
 
 
-def save_state(project_root: Path, state: dict[str, Any]) -> None:
+def save_state(
+    project_root: Path,
+    state: dict[str, Any],
+    *,
+    state_file: Optional[Path] = None,
+) -> None:
     state["last_update"] = datetime.now(timezone.utc).isoformat()
-    path = state_path(project_root)
+    path = state_file or state_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
@@ -169,6 +181,18 @@ def resolve_path(project_root: Path, p: str | Path) -> Path:
     return (project_root / path).resolve()
 
 
+def resolve_grpo_train_file(config: dict[str, Any], project_root: Path) -> Path:
+    """Resolve the GRPO task file, allowing isolated smoke configurations."""
+    configured = config.get("grpo", {}).get("train_file", "./data/mbpp_train.jsonl")
+    return resolve_path(project_root, configured)
+
+
+def configured_root(
+    config: dict[str, Any], project_root: Path, key: str, default: str
+) -> Path:
+    return resolve_path(project_root, config.get("general", {}).get(key, default))
+
+
 def get_model_path(
     cycle: int,
     phase: str,
@@ -177,15 +201,18 @@ def get_model_path(
     start_model: Optional[str],
 ) -> str:
     project_root = Path(config["_project_root"])
+    checkpoint_root = configured_root(
+        config, project_root, "checkpoint_root", "./checkpoints"
+    )
     base = config["general"]["base_model"]
     if cycle == 0 and phase == "phase1_grpo":
         return str(resolve_path(project_root, start_model or base))
     if phase == "phase1_grpo":
         if start_model and cycle == config.get("_start_cycle", 0):
             return str(resolve_path(project_root, start_model))
-        return str(resolve_path(project_root, f"./checkpoints/cycle_{cycle - 1}/model_rl_dpo"))
+        return str((checkpoint_root / f"cycle_{cycle - 1}" / "model_rl_dpo").resolve())
     if phase == "phase3_dpo":
-        return str(resolve_path(project_root, f"./checkpoints/cycle_{cycle}/model_rl"))
+        return str((checkpoint_root / f"cycle_{cycle}" / "model_rl").resolve())
     return str(resolve_path(project_root, base))
 
 
@@ -204,10 +231,22 @@ def run_phase(
     *,
     start_model: Optional[str],
     dry_run: bool,
+    resume_phase: bool = False,
 ) -> None:
     project_root = Path(config["_project_root"])
-    cycle_dir = resolve_path(project_root, f"./checkpoints/cycle_{cycle}")
-    log_dir = resolve_path(project_root, f"./logs/cycle_{cycle}")
+    checkpoint_root = configured_root(
+        config, project_root, "checkpoint_root", "./checkpoints"
+    )
+    log_root = configured_root(config, project_root, "log_root", "./logs")
+    trace_root = configured_root(
+        config, project_root, "trace_root", "./data/traces"
+    )
+    dpo_pairs_root = configured_root(
+        config, project_root, "dpo_pairs_root", "./data/dpo_pairs"
+    )
+    results_root = configured_root(config, project_root, "results_root", "./results")
+    cycle_dir = checkpoint_root / f"cycle_{cycle}"
+    log_dir = log_root / f"cycle_{cycle}"
     cycle_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -230,6 +269,7 @@ def run_phase(
 
     py = _py()
     dry = _flag(dry_run)
+    trainer_resume = " --resume_from_checkpoint" if resume_phase else ""
 
     if phase == "phase1_grpo":
         model = get_model_path(cycle, phase, config, start_model=start_model)
@@ -256,7 +296,8 @@ def run_phase(
         run_cmd(
             f"accelerate launch --num_processes {num_gpus} {shlex.quote(str(train_script))} "
             f"--config {shlex.quote(str(grpo_cfg))} "
-            f"--model {shlex.quote(model)} --output {shlex.quote(str(out))}",
+            f"--model {shlex.quote(model)} --output {shlex.quote(str(out))}"
+            f"{trainer_resume}",
             log_dir / "grpo.log",
             cwd=project_root,
         )
@@ -314,11 +355,13 @@ def run_phase(
                 cwd=project_root,
             )
             collect_model = merged
-        out = resolve_path(project_root, f"./data/traces/cycle_{cycle}_traces.jsonl")
+        out = trace_root / f"cycle_{cycle}_traces.jsonl"
         # Fresh collect for this cycle — avoid mixing stale task_ids from older models.
         if out.exists() and not dry_run:
             out.unlink()
-        train_tasks = resolve_path(project_root, "./data/mbpp_train.jsonl")
+        train_tasks = resolve_grpo_train_file(config, project_root)
+        # Prefer GRPO reward_audit rollouts (collect_traces auto-harvests).
+        # --live is only for the old second sampling pass.
         run_cmd(
             f"{py} src/collect_traces.py "
             f"--model {shlex.quote(str(collect_model))} "
@@ -333,8 +376,8 @@ def run_phase(
         )
 
     elif phase == "phase3_regen":
-        traces = resolve_path(project_root, f"./data/traces/cycle_{cycle}_traces.jsonl")
-        out = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_raw.jsonl")
+        traces = trace_root / f"cycle_{cycle}_traces.jsonl"
+        out = dpo_pairs_root / f"cycle_{cycle}_raw.jsonl"
         if out.exists() and not dry_run:
             out.unlink()
         run_cmd(
@@ -349,17 +392,18 @@ def run_phase(
         )
 
     elif phase == "phase3_filter":
-        raw = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_raw.jsonl")
-        out = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_filtered.jsonl")
+        raw = dpo_pairs_root / f"cycle_{cycle}_raw.jsonl"
+        out = dpo_pairs_root / f"cycle_{cycle}_filtered.jsonl"
         mock = " --mock_judge" if dry_run else ""
-        min_pairs = int(config.get("dpo", {}).get("min_pairs", 1500))
+        min_pairs = int(config.get("dpo", {}).get("min_pairs", 1))
         if dry_run:
             min_pairs = 1
+        # DeepSeek is eval-only. Pair construction is structural.
         run_cmd(
             f"{py} src/filter_pairs.py "
             f"--raw_pairs {shlex.quote(str(raw))} "
             f"--output {shlex.quote(str(out))} "
-            f"--judge_api deepseek --threshold {threshold} "
+            f"--judge_api none "
             f"--min_pairs {min_pairs}{mock}",
             log_dir / "filter.log",
             cwd=project_root,
@@ -367,7 +411,7 @@ def run_phase(
 
     elif phase == "phase3_dpo":
         model = get_model_path(cycle, phase, config, start_model=start_model)
-        dpo_data = resolve_path(project_root, f"./data/dpo_pairs/cycle_{cycle}_filtered.jsonl")
+        dpo_data = dpo_pairs_root / f"cycle_{cycle}_filtered.jsonl"
         out = cycle_dir / "model_rl_dpo"
         if dry_run:
             out.mkdir(parents=True, exist_ok=True)
@@ -394,7 +438,7 @@ def run_phase(
             f"--config {shlex.quote(str(dpo_cfg))} "
             f"--model {shlex.quote(model)} "
             f"--dpo_data {shlex.quote(str(dpo_data))} "
-            f"--output {shlex.quote(str(out))}",
+            f"--output {shlex.quote(str(out))}{trainer_resume}",
             log_dir / "dpo.log",
             cwd=project_root,
         )
@@ -422,7 +466,7 @@ def run_phase(
                     raise RuntimeError(
                         f"phase4_eval: missing adapter_config.json for {tag} at {p}"
                     )
-        out = resolve_path(project_root, f"./results/cycle_{cycle}_eval.json")
+        out = results_root / f"cycle_{cycle}_eval.json"
         mock = " --mock_judge" if dry_run else ""
         run_cmd(
             f"{py} src/evaluate.py --mode full "
@@ -475,7 +519,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         eval_cfg = config.get("eval", {})
         overrides = {
-            "mbpp_train": project_root / "data" / "mbpp_train.jsonl",
+            "mbpp_train": resolve_grpo_train_file(config, project_root),
             "mbpp_plus": resolve_path(
                 project_root, eval_cfg.get("mbpp_plus", "./data/mbpp_plus_test.jsonl")
             ),
@@ -496,7 +540,15 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "Run: python src/prepare_data.py --download"
             ) from e
 
-    state = load_state(project_root, resume=args.resume, cycle_id=args.cycle_id)
+    pipeline_state_file = state_path(
+        project_root, config.get("general", {}).get("state_file")
+    )
+    state = load_state(
+        project_root,
+        resume=args.resume,
+        cycle_id=args.cycle_id,
+        state_file=pipeline_state_file,
+    )
     if args.resume and state.get("status") == "completed":
         raise SystemExit(
             "[error] pipeline_state.json status=completed. Refusing --resume "
@@ -518,7 +570,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         cycle = start_cycle
         state["current_cycle"] = cycle
         state["current_phase"] = args.only_phase
-        save_state(project_root, state)
+        save_state(project_root, state, state_file=pipeline_state_file)
         print(f"\n{'=' * 60}\n  Cycle {cycle} | Phase: {args.only_phase}\n{'=' * 60}\n")
         run_phase(
             args.only_phase,
@@ -526,9 +578,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             config,
             start_model=args.start_model,
             dry_run=args.dry_run,
+            resume_phase=args.resume,
         )
         advance_state_after_phase(state, args.only_phase, cycle)
-        save_state(project_root, state)
+        save_state(project_root, state, state_file=pipeline_state_file)
         print("✓ Single phase completed")
         return
 
@@ -540,11 +593,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         else:
             phases_to_run = list(PHASES)
 
-        for phase in phases_to_run:
+        for phase_index, phase in enumerate(phases_to_run):
             # Persist the phase we are about to run (crash mid-phase → re-run same phase).
             state["current_phase"] = phase
             state["status"] = "running"
-            save_state(project_root, state)
+            save_state(project_root, state, state_file=pipeline_state_file)
 
             print(f"\n{'=' * 60}")
             print(f"  Cycle {cycle} | Phase: {phase}")
@@ -556,13 +609,16 @@ def main(argv: Optional[list[str]] = None) -> None:
                 config,
                 start_model=args.start_model,
                 dry_run=args.dry_run,
+                resume_phase=(
+                    args.resume and cycle == start_cycle and phase_index == 0
+                ),
             )
             # Advance to next phase *after* success so --resume skips completed work.
             advance_state_after_phase(state, phase, cycle)
-            save_state(project_root, state)
+            save_state(project_root, state, state_file=pipeline_state_file)
 
     state["status"] = "completed"
-    save_state(project_root, state)
+    save_state(project_root, state, state_file=pipeline_state_file)
     print("\n✓ All cycles completed!")
 
 

@@ -13,7 +13,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from utils.code_executor import compute_reward, separate_output  # noqa: E402
+from utils.harvest_rollouts import (  # noqa: E402
+    find_reward_audit_dir,
+    harvest_rollouts,
+    write_traces,
+)
 from utils.prompts import build_coding_messages  # noqa: E402
+from utils.thinking_budget import (  # noqa: E402
+    build_thinking_budget_logits_processor,
+)
 
 
 def _progress(iterable, total: Optional[int] = None, desc: str = ""):
@@ -64,8 +72,10 @@ def load_done_ids(output: Path) -> set[str]:
     return done
 
 
-def _build_messages(task_prompt: str) -> list[dict[str, str]]:
-    return build_coding_messages(task_prompt)
+def _build_messages(
+    task_prompt: str, public_test_cases: Optional[list[str]] = None
+) -> list[dict[str, str]]:
+    return build_coding_messages(task_prompt, public_test_cases)
 
 
 def _fake_trace_from_gt(task: dict[str, Any]) -> dict[str, Any]:
@@ -111,10 +121,21 @@ class TraceGenerator:
         temperature: float,
         max_new_tokens: int,
         enable_thinking: bool,
+        thinking_budget_tokens: Optional[int] = None,
     ):
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
         self.enable_thinking = enable_thinking
+        self.thinking_budget_tokens = thinking_budget_tokens
+        if thinking_budget_tokens is not None and not enable_thinking:
+            raise ValueError(
+                "thinking_budget_tokens requires enable_thinking=True"
+            )
+        if thinking_budget_tokens is not None and use_vllm:
+            raise ValueError(
+                "thinking_budget_tokens is not implemented for vLLM; refusing "
+                "to silently ignore the budget"
+            )
         self.use_vllm = use_vllm
         self.tokenizer = None
         self.model = None
@@ -188,8 +209,10 @@ class TraceGenerator:
             self.model.eval()
             self._device = model_input_device(self.model)
 
-    def generate(self, task_prompt: str) -> str:
-        messages = _build_messages(task_prompt)
+    def generate(
+        self, task_prompt: str, public_test_cases: Optional[list[str]] = None
+    ) -> str:
+        messages = _build_messages(task_prompt, public_test_cases)
         text = self._apply_chat(
             self.tokenizer,
             messages,
@@ -206,6 +229,15 @@ class TraceGenerator:
 
         inputs = self.tokenizer(text, return_tensors="pt")
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        generation_kwargs = {}
+        if self.thinking_budget_tokens is not None:
+            generation_kwargs["logits_processor"] = (
+                build_thinking_budget_logits_processor(
+                    self.tokenizer,
+                    prompt_length=inputs["input_ids"].shape[1],
+                    thinking_budget_tokens=self.thinking_budget_tokens,
+                )
+            )
         with torch.no_grad():
             out = self.model.generate(
                 **inputs,
@@ -213,13 +245,14 @@ class TraceGenerator:
                 temperature=self.temperature,
                 do_sample=self.temperature > 0,
                 top_p=0.9,
+                **generation_kwargs,
             )
         gen = out[0][inputs["input_ids"].shape[1] :]
         return self.tokenizer.decode(gen, skip_special_tokens=False)
 
 
 def collect_single_trace(generator: TraceGenerator, task: dict[str, Any]) -> dict[str, Any]:
-    output = generator.generate(task["prompt"])
+    output = generator.generate(task["prompt"], (task.get("test_cases") or [])[:1])
     separated = separate_output(output)
     reward = compute_reward(output, task.get("test_cases") or [])
     return {
@@ -244,14 +277,65 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max_new_tokens", type=int, default=768)
     parser.add_argument("--enable_thinking", type=_str2bool, default=True)
+    parser.add_argument(
+        "--thinking_budget_tokens",
+        type=int,
+        default=None,
+        help="Force </think> after this many thinking tokens, then continue output",
+    )
     parser.add_argument("--use_vllm", type=_str2bool, default=False)
     parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Generate fake traces from ground-truth (no GPU)",
     )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Ignore reward_audit and sample the model (old collect path)",
+    )
+    parser.add_argument(
+        "--min_reward",
+        type=float,
+        default=0.0,
+        help="Keep GRPO rollouts with reward strictly greater than this",
+    )
+    parser.add_argument(
+        "--later_frac",
+        type=float,
+        default=1.0 / 3.0,
+        help="Prefer this last fraction of GRPO audit calls (fallback if too few)",
+    )
     args = parser.parse_args(argv)
 
+    if args.dry_run:
+        _write_live_or_dry_traces(args, dry_run=True)
+        return
+
+    audit_dir = None if args.live else find_reward_audit_dir(args.model)
+    if audit_dir is not None:
+        traces, stats = harvest_rollouts(
+            audit_dir,
+            args.tasks,
+            min_reward=args.min_reward,
+            later_frac=args.later_frac,
+            max_traces=args.num_tasks,
+        )
+        write_traces(traces, args.output)
+        print(f"[harvest] {json.dumps(stats, ensure_ascii=False)}")
+        print(f"Wrote {len(traces)} harvested traces → {args.output}")
+        return
+
+    if not args.live:
+        raise SystemExit(
+            f"[error] No reward_audit under {args.model}. "
+            "DPO traces now come from GRPO rollouts. Re-run GRPO so "
+            "reward_audit/reward_rank*.jsonl exists, or pass --live to sample."
+        )
+    _write_live_or_dry_traces(args, dry_run=False)
+
+
+def _write_live_or_dry_traces(args: argparse.Namespace, *, dry_run: bool) -> None:
     tasks = load_jsonl(args.tasks)[: args.num_tasks]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     done = load_done_ids(args.output)
@@ -259,7 +343,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     print(f"Tasks: {len(tasks)} total, {len(done)} done, {len(remaining)} remaining")
 
     generator = None
-    if not args.dry_run:
+    if not dry_run:
         generator = TraceGenerator(
             args.model,
             args.base_model_path,
@@ -267,11 +351,12 @@ def main(argv: Optional[list[str]] = None) -> None:
             temperature=args.temperature,
             max_new_tokens=args.max_new_tokens,
             enable_thinking=args.enable_thinking,
+            thinking_budget_tokens=args.thinking_budget_tokens,
         )
 
     with open(args.output, "a", encoding="utf-8") as fout:
         for task in _progress(remaining, total=len(remaining), desc="Collecting traces"):
-            if args.dry_run:
+            if dry_run:
                 record = _fake_trace_from_gt(task)
             else:
                 record = collect_single_trace(generator, task)

@@ -11,6 +11,50 @@ class ConfigError(RuntimeError):
     """Invalid or incompatible configuration for a real run."""
 
 
+def resolve_trainer_resume_checkpoint(
+    requested: object,
+    output_dir: Path,
+    *,
+    root: Optional[Path] = None,
+) -> Optional[Path]:
+    """Resolve an explicit or ``auto`` Transformers Trainer checkpoint.
+
+    Auto-resume only accepts directories containing ``trainer_state.json`` and
+    chooses the highest numeric ``checkpoint-N``. A requested resume never
+    silently falls back to a fresh run.
+    """
+    if requested in (None, False, "", "false", "False", "none", "None"):
+        return None
+
+    if requested is True or str(requested).lower() == "auto":
+        candidates: list[tuple[int, Path]] = []
+        if output_dir.is_dir():
+            for path in output_dir.glob("checkpoint-*"):
+                if not path.is_dir() or not (path / "trainer_state.json").is_file():
+                    continue
+                try:
+                    step = int(path.name.rsplit("-", 1)[1])
+                except (IndexError, ValueError):
+                    continue
+                candidates.append((step, path.resolve()))
+        if not candidates:
+            raise ConfigError(
+                f"Resume requested but no valid checkpoint-N/trainer_state.json "
+                f"exists under {output_dir}. Refusing to silently start over."
+            )
+        return max(candidates, key=lambda item: item[0])[1]
+
+    path = Path(str(requested))
+    if not path.is_absolute():
+        path = ((root or output_dir.parent) / path).resolve()
+    if not path.is_dir() or not (path / "trainer_state.json").is_file():
+        raise ConfigError(
+            f"Invalid resume checkpoint {path}: expected a directory containing "
+            "trainer_state.json."
+        )
+    return path
+
+
 def require_exists(path: Union[str, Path], what: str) -> Path:
     p = Path(path)
     if not p.exists():

@@ -12,7 +12,20 @@ import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Sequence
+
+# Cap concurrent test subprocesses. Do not ProcessPool/fork from a CUDA parent.
+_DEFAULT_EXEC_WORKERS = 16
+
+
+def _max_exec_workers(n: int) -> int:
+    raw = os.environ.get("CODE_EXEC_MAX_WORKERS", str(_DEFAULT_EXEC_WORKERS))
+    try:
+        cap = int(raw)
+    except ValueError:
+        cap = _DEFAULT_EXEC_WORKERS
+    return max(1, min(n, cap))
 
 
 def extract_code(output: str) -> str:
@@ -73,6 +86,26 @@ def execute_test(code: str, test_case: str, timeout: int = 10) -> bool:
                 pass
 
 
+def execute_tests(
+    code: str,
+    test_cases: Sequence[str],
+    timeout: int = 10,
+) -> List[bool]:
+    """Run many ``execute_test`` subprocesses concurrently.
+
+    Isolation stays in the child Python process. A thread pool only waits on
+    those children so the CUDA training process is never forked.
+    """
+    cases = list(test_cases)
+    if not cases:
+        return []
+    if len(cases) == 1:
+        return [execute_test(code, cases[0], timeout)]
+    workers = _max_exec_workers(len(cases))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(lambda tc: execute_test(code, tc, timeout), cases))
+
+
 def safe_execute(code: str, test_case: str, timeout: int = 5) -> bool:
     """Alias for :func:`execute_test` used by Phase 0.7 sandbox checks."""
     return execute_test(code, test_case, timeout=timeout)
@@ -98,10 +131,8 @@ def compute_reward(
         return 0.0
 
     limit = min(len(test_cases), max_test_cases)
-    passed = sum(
-        1 for tc in list(test_cases)[:limit] if execute_test(code, tc, timeout)
-    )
-    return passed / float(limit)
+    results = execute_tests(code, list(test_cases)[:limit], timeout)
+    return sum(1 for ok in results if ok) / float(limit)
 
 
 def separate_output(output: str) -> dict:
@@ -144,15 +175,33 @@ def batch_compute_rewards(
     timeout: int = 10,
     max_test_cases: int = 5,
 ) -> List[float]:
-    """Vector helper used by GRPO reward_func."""
-    rewards: List[float] = []
+    """Score many completions; all test subprocesses run concurrently."""
+    plans: List[tuple[str, List[str]]] = []
     for output, tcs in zip(outputs, test_cases_batch):
-        rewards.append(
-            compute_reward(
-                output,
-                tcs or [],
-                timeout=timeout,
-                max_test_cases=max_test_cases,
-            )
-        )
-    return rewards
+        cases = list(tcs or [])
+        code = extract_code(output)
+        limit = min(len(cases), max_test_cases)
+        plans.append((code, cases[:limit] if code else []))
+
+    jobs = [
+        (idx, code, tc)
+        for idx, (code, cases) in enumerate(plans)
+        for tc in cases
+    ]
+    passed = [0] * len(plans)
+    totals = [len(cases) for _, cases in plans]
+    if jobs:
+        workers = _max_exec_workers(len(jobs))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(execute_test, code, tc, timeout)
+                for _, code, tc in jobs
+            ]
+            for (idx, _, _), fut in zip(jobs, futures):
+                if fut.result():
+                    passed[idx] += 1
+
+    return [
+        (passed[i] / float(totals[i])) if totals[i] else 0.0
+        for i in range(len(plans))
+    ]

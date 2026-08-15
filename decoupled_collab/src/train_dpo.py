@@ -66,6 +66,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Load config, print plan, exit without training",
     )
+    p.add_argument(
+        "--resume_from_checkpoint",
+        nargs="?",
+        const="auto",
+        default=None,
+        help=(
+            "Resume from an explicit Trainer checkpoint directory, or use without "
+            "a value to select the highest valid checkpoint-N under output_dir"
+        ),
+    )
     return p.parse_args()
 
 
@@ -422,6 +432,21 @@ def main() -> int:
     }
     print_plan(cfg, args, paths)
 
+    from utils.failfast import ConfigError, resolve_trainer_resume_checkpoint
+
+    resume_requested = args.resume_from_checkpoint
+    if resume_requested is None:
+        resume_requested = cfg.get("training", {}).get("resume_from_checkpoint")
+    try:
+        resume_checkpoint = resolve_trainer_resume_checkpoint(
+            resume_requested, output_dir, root=ROOT
+        )
+    except ConfigError as e:
+        print(f"[error] {e}")
+        return 1
+    if resume_checkpoint is not None:
+        print(f"[info] Will resume Trainer state from {resume_checkpoint}")
+
     if args.dry_run:
         print(
             "[dry_run] Exiting before model load / training. "
@@ -579,7 +604,11 @@ def main() -> int:
     trainer = _make_trainer(trainer_kwargs)
 
     print("[info] Starting DPO training...")
-    trainer.train()
+    trainer.train(
+        resume_from_checkpoint=(
+            str(resume_checkpoint) if resume_checkpoint is not None else None
+        )
+    )
 
     print(f"[info] Saving DPO LoRA adapter to {output_dir}")
     trainer.save_model(str(output_dir))

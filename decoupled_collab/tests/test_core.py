@@ -20,7 +20,13 @@ from prepare_data import (  # noqa: E402
 from utils.benchmarks import require_real_benchmark  # noqa: E402
 from utils.failfast import ConfigError  # noqa: E402
 from utils.api_judge import filter_pair, mock_judge_scores, parse_json_score  # noqa: E402
-from utils.code_executor import compute_reward, execute_test, separate_output  # noqa: E402
+from utils.code_executor import (  # noqa: E402
+    batch_compute_rewards,
+    compute_reward,
+    execute_test,
+    execute_tests,
+    separate_output,
+)
 from utils.metrics import hypothesis_check  # noqa: E402
 from utils.prompts import build_dpo_messages, build_dpo_prompt, build_regen_messages  # noqa: E402
 
@@ -52,6 +58,23 @@ def test_compute_reward_pass_fail():
 
 def test_execute_test():
     assert execute_test("def add(a,b): return a+b", "assert add(1,2)==3") is True
+
+
+def test_execute_tests_concurrent_mixed():
+    code = "def add(a,b): return a+b"
+    cases = [
+        "assert add(1,2)==3",
+        "assert add(0,0)==0",
+        "assert add(1,2)==0",
+    ]
+    assert execute_tests(code, cases) == [True, True, False]
+    assert batch_compute_rewards(
+        [
+            "```python\ndef add(a,b):\n    return a+b\n```",
+            "```python\ndef add(a,b):\n    return a-b\n```",
+        ],
+        [cases, ["assert add(1,2)==3", "assert add(2,3)==5"]],
+    ) == [pytest.approx(2 / 3), 0.0]
 
 
 def test_parse_json_score_and_filter():
@@ -107,6 +130,44 @@ def test_prepare_grpo_tasks_from_fake_disk(tmp_path, monkeypatch):
     row = json.loads(train_out.read_text().strip())
     assert row["source"] == "mbpp_full"
     assert row["synthetic"] is False
+
+
+def test_prepare_grpo_uses_all_splits_and_excludes_mbpp_plus(tmp_path, monkeypatch):
+    import prepare_data as pd
+
+    fake_full = {
+        "train": [{"task_id": 1, "text": "one", "test_list": ["assert one()"]}],
+        "test": [{"task_id": 2, "text": "two", "test_list": ["assert two()"]}],
+        "validation": [
+            {"task_id": 3, "text": "three", "test_list": ["assert three()"]}
+        ],
+        "prompt": [{"task_id": 4, "text": "four", "test_list": ["assert four()"]}],
+    }
+    monkeypatch.setattr(pd, "_load_mbpp", lambda *args, **kwargs: fake_full)
+    eval_file = tmp_path / "eval.jsonl"
+    eval_file.write_text(json.dumps({"task_id": "Mbpp/2"}) + "\n", encoding="utf-8")
+
+    tasks = pd.prepare_grpo_tasks(
+        tmp_path / "full",
+        tmp_path / "train.jsonl",
+        exclude_task_ids_path=eval_file,
+    )
+
+    assert [task["task_id"] for task in tasks] == ["mbpp_1", "mbpp_3", "mbpp_4"]
+
+
+def test_mbpp_train_eval_overlap_fails(tmp_path):
+    from utils.benchmarks import require_mbpp_disjoint
+
+    train = tmp_path / "train.jsonl"
+    evaluation = tmp_path / "eval.jsonl"
+    train.write_text(json.dumps({"task_id": "mbpp_602"}) + "\n", encoding="utf-8")
+    evaluation.write_text(
+        json.dumps({"task_id": "Mbpp/602"}) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError, match="contamination"):
+        require_mbpp_disjoint(train, evaluation)
 
 
 def test_prepare_eval_tasks_disabled():

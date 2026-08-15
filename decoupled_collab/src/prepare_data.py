@@ -55,6 +55,47 @@ def _iter_split_items(ds: Any, preferred_splits: Iterable[str]) -> list[Any]:
     return list(ds)
 
 
+def _iter_all_split_items(ds: Any, preferred_splits: Iterable[str]) -> list[Any]:
+    """Return every requested split in deterministic order."""
+    if not hasattr(ds, "keys"):
+        return list(ds)
+    keys = list(ds.keys())
+    rows: list[Any] = []
+    for split in preferred_splits:
+        if split in keys:
+            rows.extend(list(ds[split]))
+    return rows
+
+
+def _mbpp_numeric_id(value: Any) -> int:
+    """Normalize IDs such as ``601``, ``mbpp_601`` and ``Mbpp/601``."""
+    match = re.search(r"(\d+)$", str(value))
+    if not match:
+        raise ValueError(f"Unparseable MBPP task_id: {value!r}")
+    return int(match.group(1))
+
+
+def _load_mbpp_excluded_ids(path: Path) -> set[int]:
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"MBPP+ exclusion file not found: {path}. Prepare MBPP+ before GRPO data "
+            "so evaluation tasks cannot leak into training."
+        )
+    excluded: set[int] = set()
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                excluded.add(_mbpp_numeric_id(row["task_id"]))
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                raise ValueError(f"{path}:{line_number}: invalid MBPP+ task_id: {exc}") from exc
+    if not excluded:
+        raise ValueError(f"MBPP+ exclusion file has no task IDs: {path}")
+    return excluded
+
+
 def _load_mbpp(path: Path, download: bool, config_name: str) -> Any:
     if path.exists():
         try:
@@ -150,14 +191,26 @@ def prepare_grpo_tasks(
     output: Path,
     *,
     download: bool = False,
+    exclude_task_ids_path: Optional[Path] = None,
 ) -> list[dict[str, Any]]:
     ds = _load_mbpp(raw_mbpp_full, download=download, config_name="full")
-    rows = _iter_split_items(ds, preferred_splits=("train", "test", "prompt", "validation"))
+    rows = _iter_all_split_items(
+        ds, preferred_splits=("train", "test", "validation", "prompt")
+    )
+    excluded = (
+        _load_mbpp_excluded_ids(exclude_task_ids_path)
+        if exclude_task_ids_path is not None
+        else set()
+    )
 
     tasks: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
     for item in rows:
         item = _normalize_item(item)
-        task_id = item.get("task_id", len(tasks))
+        task_id = _mbpp_numeric_id(item.get("task_id", len(tasks)))
+        if task_id in excluded or task_id in seen_ids:
+            continue
+        seen_ids.add(task_id)
         prompt = item.get("text") or item.get("prompt") or item.get("description") or ""
         test_cases = item.get("test_list") or item.get("test_cases") or []
         if isinstance(test_cases, str):
@@ -280,7 +333,12 @@ def prepare_eval_tasks(
 # ---------------------------------------------------------------------------
 
 
-def prepare_lcb_easy(output: Path, *, download: bool = False) -> list[dict[str, Any]]:
+def prepare_lcb_easy(
+    output: Path,
+    *,
+    download: bool = False,
+    source_jsonl: Optional[List[Path]] = None,
+) -> list[dict[str, Any]]:
     """
     Prepare LiveCodeBench-easy. Fails hard if data cannot be loaded when download=True.
 
@@ -289,80 +347,110 @@ def prepare_lcb_easy(output: Path, *, download: bool = False) -> list[dict[str, 
     tasks: list[dict[str, Any]] = []
     errors: list[str] = []
 
-    try:
-        from datasets import load_dataset
-    except ImportError as e:
-        raise ImportError("datasets package required for LiveCodeBench download") from e
+    load_dataset = None
+    candidates: list[tuple[str, Optional[str]]] = []
+    if not source_jsonl:
+        try:
+            from datasets import load_dataset as hf_load_dataset
+        except ImportError as e:
+            raise ImportError("datasets package required for LiveCodeBench download") from e
+        load_dataset = hf_load_dataset
+        candidates = [
+            # Pin v1. The dataset's default release_latest configuration downloads
+            # every historical JSONL shard (multiple GB) even though we only retain
+            # easy rows and public tests.
+            ("livecodebench/code_generation_lite", "v1"),
+            ("livecodebench/code_generation", None),
+        ]
 
-    candidates = [
-        ("livecodebench/code_generation_lite", None),
-        ("livecodebench/code_generation", None),
-    ]
+    def convert_rows(rows: Any, dataset_name: str) -> None:
+        for i, item in enumerate(rows):
+            item = _normalize_item(item)
+            difficulty = str(item.get("difficulty", item.get("level", ""))).lower()
+            if difficulty and difficulty not in ("easy", "e"):
+                continue
+            prompt = (
+                item.get("question_content")
+                or item.get("prompt")
+                or item.get("problem")
+                or item.get("question")
+                or ""
+            )
+            from utils.lcb_executor import parse_public_test_cases
+
+            raw_tests = (
+                item.get("public_test_cases")
+                or item.get("input_output")
+                or item.get("test_cases")
+                or item.get("tests")
+                or []
+            )
+            lcb_tests = parse_public_test_cases(raw_tests)
+            # Some HF rows put fn_name only in metadata
+            meta = item.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except json.JSONDecodeError:
+                    meta = {}
+            fn_name = None
+            if isinstance(meta, dict):
+                fn_name = meta.get("func_name") or meta.get("fn_name")
+            if fn_name:
+                for case in lcb_tests:
+                    if case.get("type") == "call" and not case.get("fn_name"):
+                        case["fn_name"] = fn_name
+            if not prompt or not lcb_tests:
+                continue
+            tasks.append(
+                {
+                    "task_id": f"lcb_{item.get('question_id', item.get('task_id', i))}",
+                    "prompt": prompt,
+                    "harness": "lcb",
+                    "lcb_tests": lcb_tests,
+                    "test_cases": [],
+                    "difficulty": "easy",
+                    "source": "livecodebench_easy",
+                    "benchmark": "lcb_easy",
+                    "dataset": dataset_name,
+                    "synthetic": False,
+                }
+            )
+
+    if source_jsonl:
+        for source in source_jsonl:
+            if not source.is_file():
+                errors.append(f"{source}: file not found")
+                continue
+            print(f"[info] Reading cached LiveCodeBench JSONL {source} ...")
+            try:
+                def iter_jsonl() -> Any:
+                    with source.open(encoding="utf-8") as handle:
+                        for line_number, line in enumerate(handle, 1):
+                            try:
+                                yield json.loads(line)
+                            except json.JSONDecodeError as exc:
+                                raise ValueError(
+                                    f"{source}:{line_number}: invalid JSON: {exc}"
+                                ) from exc
+
+                convert_rows(iter_jsonl(), f"local:{source.name}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{source}: {exc}")
+        # Explicit local sources must never trigger an implicit network fallback.
+        candidates = []
 
     for name, subset in candidates:
         try:
             print(f"[info] Trying LiveCodeBench dataset {name!r} ...")
             kwargs = {"trust_remote_code": True}
+            assert load_dataset is not None
             if subset:
                 ds = load_dataset(name, subset, **kwargs)
             else:
                 ds = load_dataset(name, **kwargs)
             rows = _iter_split_items(ds, preferred_splits=("test", "train", "validation"))
-            for i, item in enumerate(rows):
-                item = _normalize_item(item)
-                difficulty = str(item.get("difficulty", item.get("level", ""))).lower()
-                if difficulty and difficulty not in ("easy", "e"):
-                    continue
-                prompt = (
-                    item.get("question_content")
-                    or item.get("prompt")
-                    or item.get("problem")
-                    or item.get("question")
-                    or ""
-                )
-                from utils.lcb_executor import parse_public_test_cases
-
-                raw_tests = (
-                    item.get("public_test_cases")
-                    or item.get("input_output")
-                    or item.get("test_cases")
-                    or item.get("tests")
-                    or []
-                )
-                lcb_tests = parse_public_test_cases(raw_tests)
-                # Some HF rows put fn_name only in metadata
-                meta = item.get("metadata") or {}
-                if isinstance(meta, str):
-                    try:
-                        meta = json.loads(meta)
-                    except json.JSONDecodeError:
-                        meta = {}
-                fn_name = None
-                if isinstance(meta, dict):
-                    fn_name = meta.get("func_name") or meta.get("fn_name")
-                if fn_name:
-                    for c in lcb_tests:
-                        if c.get("type") == "call" and not c.get("fn_name"):
-                            c["fn_name"] = fn_name
-                if not prompt or not lcb_tests:
-                    continue
-                tasks.append(
-                    {
-                        "task_id": f"lcb_{item.get('question_id', item.get('task_id', i))}",
-                        "prompt": prompt,
-                        # Structured cases for utils.lcb_executor (stdin / call).
-                        "harness": "lcb",
-                        "lcb_tests": lcb_tests,
-                        # Keep empty assert list so MBPP-style executors do not
-                        # mis-read JSON dumps as Python asserts.
-                        "test_cases": [],
-                        "difficulty": "easy",
-                        "source": "livecodebench_easy",
-                        "benchmark": "lcb_easy",
-                        "dataset": name,
-                        "synthetic": False,
-                    }
-                )
+            convert_rows(rows, name)
             if tasks:
                 break
             errors.append(f"{name}: loaded but 0 easy rows")
@@ -417,6 +505,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--eval-output", type=Path, default=ROOT / "data" / "mbpp_plus_test.jsonl"
     )
     parser.add_argument("--lcb-output", type=Path, default=ROOT / "data" / "lcb_easy.jsonl")
+    parser.add_argument(
+        "--lcb-source-jsonl",
+        action="append",
+        type=Path,
+        help=(
+            "Convert an already downloaded LiveCodeBench JSONL (repeatable) "
+            "without fetching the multi-GB release_latest dataset"
+        ),
+    )
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-mbpp-plus", action="store_true")
     parser.add_argument("--skip-lcb", action="store_true")
@@ -445,27 +542,37 @@ def main(argv: Optional[List[str]] = None) -> None:
             "(EvalPlus MBPP+ release + HF MBPP full + LCB)."
         )
 
+    if not args.skip_mbpp_plus:
+        prepare_mbpp_plus_evalplus(args.eval_output, max_plus_cases=args.max_plus_cases)
+
     if not args.skip_train:
         if not args.download and not args.raw_mbpp_full.exists():
             raise SystemExit(
                 "[error] MBPP full not on disk. Re-run with --download.\n"
                 + list_benchmarks()
             )
-        prepare_grpo_tasks(args.raw_mbpp_full, args.train_output, download=args.download)
-
-    if not args.skip_mbpp_plus:
-        prepare_mbpp_plus_evalplus(args.eval_output, max_plus_cases=args.max_plus_cases)
+        prepare_grpo_tasks(
+            args.raw_mbpp_full,
+            args.train_output,
+            download=args.download,
+            exclude_task_ids_path=args.eval_output,
+        )
 
     if not args.skip_lcb:
         try:
-            prepare_lcb_easy(args.lcb_output, download=args.download or True)
+            prepare_lcb_easy(
+                args.lcb_output,
+                download=args.download,
+                source_jsonl=args.lcb_source_jsonl,
+            )
         except Exception as e:  # noqa: BLE001
             if args.allow_missing_lcb:
                 print(f"[warn] LCB prepare failed (--allow-missing-lcb): {e}")
             else:
                 raise SystemExit(f"[error] {e}\n\n{list_benchmarks()}") from e
 
-    print("✓ Real benchmark/training data preparation finished")
+    # Keep CLI output compatible with Windows terminals that still default to GBK.
+    print("[ok] Real benchmark/training data preparation finished")
     print(list_benchmarks())
 
 

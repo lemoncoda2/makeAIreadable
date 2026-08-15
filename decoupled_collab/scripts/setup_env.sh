@@ -29,7 +29,7 @@ pip install "torch==${TORCH_VER}" --index-url "${TORCH_CUDA_INDEX}" || {
 echo "==> pip install -r requirements.txt"
 pip install -r requirements.txt
 
-if [[ "${INSTALL_VLLM:-1}" == "1" ]]; then
+if [[ "${INSTALL_VLLM:-0}" == "1" ]]; then
   echo "==> Installing optional vllm==0.8.5 (Qwen3 + V100 pin). Set INSTALL_VLLM=0 to skip."
   pip install "vllm==0.8.5" || {
     echo "[warn] vllm==0.8.5 install failed. Continuing with HF-only inference."
@@ -37,9 +37,17 @@ if [[ "${INSTALL_VLLM:-1}" == "1" ]]; then
   }
 fi
 
+if [[ "${INSTALL_DEEPSPEED:-0}" == "1" ]]; then
+  echo "==> Installing optional deepspeed==0.15.4"
+  pip install "deepspeed==0.15.4"
+fi
+
 echo "==> Verifying CUDA / arch / transformers"
 python3 - <<'PY'
+import importlib.util
 import torch, transformers
+if importlib.util.find_spec("bitsandbytes") is not None:
+    raise SystemExit("[error] bitsandbytes must not be installed; use unquantized FP16")
 print(f"torch={torch.__version__} cuda={torch.cuda.is_available()} n_gpu={torch.cuda.device_count()}")
 if not torch.cuda.is_available():
     raise SystemExit("[error] CUDA not available after install")

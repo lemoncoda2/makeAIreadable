@@ -4,16 +4,16 @@
 
 ```yaml
 goal_id: decoupled-collab-v1
-status: NOT_STARTED  # NOT_STARTED | IN_PROGRESS | PAUSED | COMPLETED | FAILED
-current_phase: null
-current_step: null
-last_checkpoint: null
+status: IN_PROGRESS  # NOT_STARTED | IN_PROGRESS | PAUSED | COMPLETED | FAILED
+current_phase: phase1_grpo
+current_step: cycle_0_grpo_596tasks
+last_checkpoint: checkpoints/cycle_0/model_rl
 created: 2026-08-14
 hardware: 4×V100-32G (SSH direct)  # Volta sm_70; FP16 only (no bf16)
 base_model: Qwen/Qwen3-4B (thinking mode)
 eval_api: deepseek-v4-flash (via OpenAI-compatible API)
 benchmark: MBPP+ (EvalPlus) + LiveCodeBench-easy
-project_dir: /path/to/decoupled_collab  # 修改为实际服务器路径
+project_dir: /root/makeAIreadable-20260814/workspace/decoupled_collab
 # Recommended software stack for Qwen3-4B + V100-32G (see Step 0.2):
 software_stack:
   python: "3.11"

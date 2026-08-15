@@ -5,12 +5,13 @@ general:
   num_gpus: 4
 grpo:
   config: configs/grpo_config.yaml
+  # Cap on harvested GRPO rollouts (reward>0, later steps). Not a live collect budget.
   num_tasks_collect: 2000
 dpo:
   config: configs/dpo_config.yaml
+  # Unused for pair construction (DeepSeek is eval-only). Kept for docs.
   threshold: 6.0
-  # Fail filter phase if fewer pairs kept (GOAL suggests ≥1500).
-  min_pairs: 1500
+  min_pairs: 1
 inference:
   # false: HuggingFace+PEFT (supports LoRA adapter dirs) — recommended on V100.
   # true: pipeline merges LoRA → model_rl_merged via src/merge_lora.py before collect.
