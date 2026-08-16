@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -15,26 +16,58 @@ sys.path.insert(0, str(ROOT / "src"))
 from utils.prompts import build_regen_messages  # noqa: E402
 
 
-def _progress(iterable, total: Optional[int] = None, desc: str = ""):
-    try:
-        from rich.progress import track
-
-        return track(iterable, total=total, description=desc or "Working...")
-    except ImportError:
-        try:
-            from tqdm import tqdm
-
-            return tqdm(iterable, total=total, desc=desc)
-        except ImportError:
-            if desc:
-                print(desc)
-            return iterable
+def _log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def _str2bool(v: str) -> bool:
     if isinstance(v, bool):
         return v
     return str(v).lower() in ("1", "true", "t", "yes", "y")
+
+
+def _cuda_count() -> int:
+    try:
+        import torch
+
+        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _resolve_num_gpus(requested: Optional[int]) -> int:
+    available = _cuda_count()
+    if available <= 0:
+        return 1
+    if requested is None or int(requested) <= 0:
+        return available
+    return min(int(requested), available)
+
+
+def _split_contiguous(items: list[Any], parts: int) -> list[list[Any]]:
+    parts = max(1, min(parts, len(items)))
+    chunks: list[list[Any]] = []
+    start = 0
+    for i in range(parts):
+        extra = 1 if i < (len(items) % parts) else 0
+        size = len(items) // parts + extra
+        chunks.append(items[start : start + size])
+        start += size
+    return [c for c in chunks if c]
+
+
+def _release_generator(generator: Any) -> None:
+    del generator
+    try:
+        import gc
+
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -79,6 +112,16 @@ def dry_run_regen(trace: dict[str, Any]) -> str:
     return f"[regen-paraphrase] {original}"
 
 
+def _reject_think(raw: str) -> str:
+    if "<think>" in raw or "</think>" in raw:
+        raise RuntimeError(
+            "Regen output still contains <think> tags despite enable_thinking=False. "
+            "Refusing to write polluted collaboration into DPO pairs. "
+            f"Snippet: {raw[:200]!r}"
+        )
+    return raw
+
+
 class RegenGenerator:
     def __init__(
         self,
@@ -87,6 +130,7 @@ class RegenGenerator:
         use_vllm: bool,
         temperature: float,
         max_new_tokens: int,
+        device: Optional[int] = 0,
     ):
         self.use_vllm = use_vllm
         self.temperature = temperature
@@ -102,11 +146,12 @@ class RegenGenerator:
             model_input_device,
             require_cuda,
         )
-        from transformers import AutoTokenizer
+        from utils.model_utils import load_tokenizer
 
         assert_not_dry_run_placeholder(model_path, what="regen base_model")
         require_cuda(dry_run=False)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        # Left padding so batched HF generate aligns new tokens.
+        self.tokenizer = load_tokenizer(model_path)
 
         if use_vllm:
             assert_not_adapter_for_vllm(model_path)
@@ -119,38 +164,64 @@ class RegenGenerator:
                 top_p=0.9,
             )
         else:
-            import torch
-            from transformers import AutoModelForCausalLM
+            from utils.model_utils import load_causal_lm
 
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                trust_remote_code=True,
+            if device is None or device == "auto":
+                device_map: Any = "auto"
+            else:
+                device_map = {"": int(device)}
+            self.model = load_causal_lm(
+                model_path, torch_dtype="float16", device_map=device_map
             )
             self.model.eval()
             self._device = model_input_device(self.model)
 
-    def generate(self, trace: dict[str, Any]) -> str:
+    def _render(self, trace: dict[str, Any]) -> str:
         from utils.model_utils import apply_chat_template_with_thinking
 
-        messages = messages_for_trace(trace)
-        # Collaboration-only regen must NOT run in Qwen3 thinking mode.
-        text = apply_chat_template_with_thinking(
+        return apply_chat_template_with_thinking(
             self.tokenizer,
-            messages,
+            messages_for_trace(trace),
             enable_thinking=False,
             tokenize=False,
             add_generation_prompt=True,
         )
-        if self.use_vllm:
-            outputs = self.llm.generate([text], self.sampling_params)
-            raw = outputs[0].outputs[0].text.strip()
-        else:
-            import torch
 
-            inputs = self.tokenizer(text, return_tensors="pt")
+    def generate(self, trace: dict[str, Any]) -> str:
+        return self.generate_many([trace], batch_size=1)[0]
+
+    def generate_many(
+        self,
+        traces: list[dict[str, Any]],
+        *,
+        batch_size: int = 8,
+    ) -> list[str]:
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if not traces:
+            return []
+        texts = [self._render(t) for t in traces]
+        if self.use_vllm:
+            raws: list[str] = []
+            for start in range(0, len(texts), batch_size):
+                chunk = texts[start : start + batch_size]
+                outputs = self.llm.generate(chunk, self.sampling_params)
+                for item in outputs:
+                    raws.append(_reject_think(item.outputs[0].text.strip()))
+                _log(f"[regen] {min(start + batch_size, len(texts))}/{len(texts)}")
+            return raws
+
+        import torch
+
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        raws = []
+        for start in range(0, len(texts), batch_size):
+            chunk = texts[start : start + batch_size]
+            inputs = self.tokenizer(chunk, return_tensors="pt", padding=True)
             inputs = {k: v.to(self._device) for k, v in inputs.items()}
+            prompt_len = int(inputs["input_ids"].shape[1])
             with torch.no_grad():
                 out = self.model.generate(
                     **inputs,
@@ -158,17 +229,106 @@ class RegenGenerator:
                     temperature=self.temperature,
                     do_sample=self.temperature > 0,
                     top_p=0.9,
+                    pad_token_id=pad_id,
                 )
-            gen = out[0][inputs["input_ids"].shape[1] :]
-            raw = self.tokenizer.decode(gen, skip_special_tokens=True).strip()
+            for row in out:
+                gen = row[prompt_len:]
+                raws.append(
+                    _reject_think(
+                        self.tokenizer.decode(gen, skip_special_tokens=True).strip()
+                    )
+                )
+            _log(f"[regen] {min(start + batch_size, len(texts))}/{len(texts)}")
+        return raws
 
-        if "<think>" in raw or "</think>" in raw:
+
+def _regen_shard(payload: dict[str, Any]) -> list[str]:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(payload["gpu"])
+    generator = RegenGenerator(
+        payload["model_path"],
+        use_vllm=False,
+        temperature=payload["temperature"],
+        max_new_tokens=payload["max_new_tokens"],
+        device=0,
+    )
+    try:
+        return generator.generate_many(
+            payload["traces"], batch_size=payload["batch_size"]
+        )
+    finally:
+        _release_generator(generator)
+
+
+def regen_traces(
+    traces: list[dict[str, Any]],
+    *,
+    model_path: str,
+    use_vllm: bool,
+    temperature: float,
+    max_new_tokens: int,
+    gen_batch_size: int,
+    num_gpus: Optional[int],
+) -> list[str]:
+    if not traces:
+        return []
+    if gen_batch_size < 1:
+        raise SystemExit(f"[error] --gen_batch_size must be >= 1, got {gen_batch_size}")
+    if use_vllm:
+        generator = RegenGenerator(
+            model_path,
+            use_vllm=True,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+        )
+        try:
+            _log(f"[regen] traces={len(traces)} backend=vllm batch={gen_batch_size}")
+            return generator.generate_many(traces, batch_size=gen_batch_size)
+        finally:
+            _release_generator(generator)
+
+    n_gpu = _resolve_num_gpus(num_gpus)
+    if n_gpu > 1 and len(traces) > 1:
+        import multiprocessing as mp
+
+        chunks = _split_contiguous(traces, n_gpu)
+        _log(
+            f"[regen] traces={len(traces)} gpus={len(chunks)} batch={gen_batch_size}"
+        )
+        payloads = [
+            {
+                "gpu": gpu,
+                "model_path": model_path,
+                "temperature": temperature,
+                "max_new_tokens": max_new_tokens,
+                "batch_size": gen_batch_size,
+                "traces": chunk,
+            }
+            for gpu, chunk in enumerate(chunks)
+        ]
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(len(payloads)) as pool:
+            parts = pool.map(_regen_shard, payloads)
+        merged: list[str] = []
+        for part in parts:
+            merged.extend(part)
+        if len(merged) != len(traces):
             raise RuntimeError(
-                "Regen output still contains <think> tags despite enable_thinking=False. "
-                "Refusing to write polluted collaboration into DPO pairs. "
-                f"Snippet: {raw[:200]!r}"
+                f"multi-GPU regen returned {len(merged)} rows for {len(traces)} traces"
             )
-        return raw
+        return merged
+
+    generator = RegenGenerator(
+        model_path,
+        use_vllm=False,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        device=0,
+    )
+    try:
+        _log(f"[regen] traces={len(traces)} gpus=1 batch={gen_batch_size}")
+        return generator.generate_many(traces, batch_size=gen_batch_size)
+    finally:
+        _release_generator(generator)
 
 
 def make_raw_pair(trace: dict[str, Any], regen_collaboration: str) -> dict[str, Any]:
@@ -195,6 +355,18 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--use_vllm", type=_str2bool, default=False)
     parser.add_argument(
+        "--gen_batch_size",
+        type=int,
+        default=8,
+        help="HF/vLLM generate batch size per GPU",
+    )
+    parser.add_argument(
+        "--num_gpus",
+        type=int,
+        default=0,
+        help="HF data-parallel GPU workers; 0 = all visible devices",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Copy collaboration with paraphrase marker (no GPU)",
@@ -205,30 +377,29 @@ def main(argv: Optional[list[str]] = None) -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     done = load_done_ids(args.output)
     remaining = [t for t in traces if t.get("task_id") not in done]
-    print(f"Traces: {len(traces)} total, {len(done)} done, {len(remaining)} remaining")
+    _log(f"Traces: {len(traces)} total, {len(done)} done, {len(remaining)} remaining")
 
-    generator = None
-    if not args.dry_run:
-        generator = RegenGenerator(
-            args.base_model,
+    if args.dry_run:
+        texts = [dry_run_regen(t) for t in remaining]
+    else:
+        texts = regen_traces(
+            remaining,
+            model_path=args.base_model,
             use_vllm=args.use_vllm,
             temperature=args.temperature,
             max_new_tokens=args.max_new_tokens,
+            gen_batch_size=args.gen_batch_size,
+            num_gpus=args.num_gpus,
         )
 
     with open(args.output, "a", encoding="utf-8") as fout:
-        for trace in _progress(remaining, total=len(remaining), desc="Regen collaboration"):
-            if args.dry_run:
-                regen = dry_run_regen(trace)
-            else:
-                regen = generator.generate(trace)
+        for trace, regen in zip(remaining, texts):
             pair = make_raw_pair(trace, regen)
             if args.dry_run:
                 pair["dry_run"] = True
             fout.write(json.dumps(pair, ensure_ascii=False) + "\n")
-            fout.flush()
 
-    print(f"Wrote raw DPO pairs → {args.output}")
+    _log(f"Wrote raw DPO pairs → {args.output}")
 
 
 if __name__ == "__main__":
