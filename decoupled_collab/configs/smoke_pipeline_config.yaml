@@ -24,3 +24,5 @@ eval:
   num_tasks_readability: 1
   mbpp_plus: ./data/smoke/mbpp_plus_test.jsonl
   lcb_easy: ./data/smoke/lcb_easy.jsonl
+  gen_batch_size: 1
+  num_gpus: 1

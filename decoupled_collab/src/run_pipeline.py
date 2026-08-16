@@ -262,6 +262,11 @@ def run_phase(
     lcb_easy = resolve_path(project_root, eval_cfg.get("lcb_easy", "./data/lcb_easy.jsonl"))
     n_bench = int(eval_cfg.get("num_tasks_benchmark", 200))
     n_read = int(eval_cfg.get("num_tasks_readability", 50))
+    eval_batch = int(eval_cfg.get("gen_batch_size", 4))
+    eval_gpus = int(eval_cfg.get("num_gpus", num_gpus))
+    eval_speed = (
+        f" --gen_batch_size {eval_batch} --num_gpus {eval_gpus}"
+    )
     base_model = str(resolve_path(project_root, config["general"]["base_model"]))
     use_vllm = bool(config.get("inference", {}).get("use_vllm", False))
     if dry_run:
@@ -327,7 +332,7 @@ def run_phase(
             f"--rl_model {shlex.quote(str(rl_path))} "
             f"--eval_data {shlex.quote(str(mbpp_plus))} "
             f"--num_tasks_benchmark {n_bench} --num_tasks_readability {n_read} "
-            f"--output {shlex.quote(str(out))}{dry}{mock}",
+            f"--output {shlex.quote(str(out))}{eval_speed}{dry}{mock}",
             log_dir / "phase1_eval.log",
             cwd=project_root,
         )
@@ -386,7 +391,7 @@ def run_phase(
             f"--traces {shlex.quote(str(traces))} "
             f"--output {shlex.quote(str(out))} "
             f"--use_vllm {'true' if use_vllm else 'false'}"
-            f"{dry}",
+            f"{eval_speed}{dry}",
             log_dir / "regen.log",
             cwd=project_root,
         )
@@ -477,6 +482,7 @@ def run_phase(
             f"--eval_data {shlex.quote(str(mbpp_plus))} "
             f"--lcb_data {shlex.quote(str(lcb_easy))} "
             f"--num_tasks_benchmark {n_bench} --num_tasks_readability {n_read} "
+            f"--gen_batch_size {eval_batch} --num_gpus {eval_gpus} "
             f"--cycle {cycle} "
             f"--output {shlex.quote(str(out))}{dry}{mock}",
             log_dir / "eval.log",

@@ -21,3 +21,5 @@ eval:
   num_tasks_readability: 50
   mbpp_plus: ./data/mbpp_plus_test.jsonl
   lcb_easy: ./data/lcb_easy.jsonl
+  gen_batch_size: 4
+  num_gpus: 4
