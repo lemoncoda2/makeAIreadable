@@ -92,7 +92,9 @@ def test_generate_for_model_passes_public_interface_and_budgets(monkeypatch):
     seen = {}
 
     class Runner:
-        def __init__(self, model_path, base_model_path=None, thinking_budget_tokens=0):
+        def __init__(
+            self, model_path, base_model_path=None, thinking_budget_tokens=0, device=0
+        ):
             seen["init"] = (model_path, base_model_path, thinking_budget_tokens)
 
         def generate(self, prompt, public_test_cases, max_new_tokens):
@@ -113,6 +115,187 @@ def test_generate_for_model_passes_public_interface_and_budgets(monkeypatch):
     assert outputs == ["ok"]
     assert seen["init"] == ("base-model", None, 256)
     assert seen["generate"] == ("write f", ["assert f() == 1"], 704)
+
+
+def test_generate_for_model_batches_many_tasks(monkeypatch):
+    import evaluate
+
+    seen = {}
+
+    class Runner:
+        def __init__(self, model_path, base_model_path=None, thinking_budget_tokens=0, device=0):
+            seen["init"] = (model_path, thinking_budget_tokens, device)
+
+        def generate(self, *args, **kwargs):
+            raise AssertionError("multi-task generate must batch")
+
+        def generate_many(self, tasks, *, max_new_tokens, batch_size, temperature=0.2):
+            seen["many"] = (len(tasks), max_new_tokens, batch_size)
+            return [f"out-{i}" for i in range(len(tasks))]
+
+    monkeypatch.setattr(evaluate, "ModelRunner", Runner)
+    monkeypatch.setattr(evaluate, "_resolve_num_gpus", lambda requested: 1)
+    outputs = evaluate.generate_for_model(
+        "base",
+        "base-model",
+        None,
+        [{"prompt": "a", "test_cases": ["assert 1"]}, {"prompt": "b"}],
+        dry_run=False,
+        max_new_tokens=768,
+        thinking_budget_tokens=256,
+        gen_batch_size=4,
+        num_gpus=1,
+    )
+    assert outputs == ["out-0", "out-1"]
+    assert seen["many"] == (2, 768, 4)
+
+
+def test_evaluate_model_reuses_bench_outputs_for_readability(monkeypatch):
+    import evaluate
+
+    calls: list[int] = []
+
+    def fake_gen(tag, path, base, tasks, **kwargs):
+        calls.append(len(tasks))
+        return [f"out-{i}" for i in range(len(tasks))]
+
+    monkeypatch.setattr(evaluate, "generate_for_model", fake_gen)
+    monkeypatch.setattr(
+        evaluate,
+        "evaluate_benchmark",
+        lambda tasks, outs: {
+            "pass_at_1": 0.5,
+            "avg_code_length": 1.0,
+            "syntax_error_rate": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        evaluate,
+        "evaluate_readability",
+        lambda tasks, outs, **kwargs: {
+            "overall": 7.0,
+            "clarity": 7.0,
+            "conciseness": 7.0,
+            "informativeness": 7.0,
+            "naturalness": 7.0,
+            "avg_collab_length": 1.0,
+            "think_leak_rate": 0.0,
+        },
+    )
+    tasks = [
+        {"prompt": f"p{i}", "task_id": i, "test_cases": ["assert True"]}
+        for i in range(8)
+    ]
+    evaluate.evaluate_model(
+        "base",
+        "model",
+        None,
+        tasks,
+        [],
+        mode="hypothesis_check",
+        dry_run=False,
+        mock_judge=True,
+        num_tasks_benchmark=8,
+        num_tasks_readability=3,
+    )
+    assert calls == [8]
+
+
+def test_evaluate_model_generates_bench_and_lcb_once(monkeypatch):
+    import evaluate
+
+    calls: list[list[str]] = []
+
+    def fake_gen(tag, path, base, tasks, **kwargs):
+        calls.append([str(t["task_id"]) for t in tasks])
+        return [f"out-{t['task_id']}" for t in tasks]
+
+    monkeypatch.setattr(evaluate, "generate_for_model", fake_gen)
+    monkeypatch.setattr(
+        evaluate,
+        "evaluate_benchmark",
+        lambda tasks, outs: {
+            "pass_at_1": 0.5,
+            "avg_code_length": 1.0,
+            "syntax_error_rate": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        evaluate,
+        "evaluate_readability",
+        lambda tasks, outs, **kwargs: {
+            "overall": 7.0,
+            "clarity": 7.0,
+            "conciseness": 7.0,
+            "informativeness": 7.0,
+            "naturalness": 7.0,
+            "avg_collab_length": 1.0,
+            "think_leak_rate": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        "utils.lcb_executor.fraction_lcb_ready", lambda tasks: 1.0
+    )
+    mbpp = [
+        {"prompt": f"p{i}", "task_id": f"m{i}", "test_cases": ["assert True"]}
+        for i in range(4)
+    ]
+    lcb = [
+        {"prompt": f"l{i}", "task_id": f"l{i}", "harness": "lcb"}
+        for i in range(3)
+    ]
+    evaluate.evaluate_model(
+        "rl",
+        "model",
+        "base",
+        mbpp,
+        lcb,
+        mode="full",
+        dry_run=False,
+        mock_judge=True,
+        num_tasks_benchmark=4,
+        num_tasks_readability=2,
+    )
+    assert len(calls) == 1
+    assert calls[0] == ["m0", "m1", "m2", "m3", "l0", "l1", "l2"]
+
+
+def test_evaluate_readability_uses_async_batch(monkeypatch):
+    import evaluate
+
+    seen = {}
+
+    async def fake_batch(items, **kwargs):
+        seen["n"] = len(items)
+        seen["conc"] = kwargs.get("max_concurrent")
+        return [
+            {
+                "score": {
+                    "clarity": 8.0,
+                    "conciseness": 8.0,
+                    "informativeness": 8.0,
+                    "naturalness": 8.0,
+                    "overall": 8.0,
+                },
+                **item,
+            }
+            for item in items
+        ]
+
+    monkeypatch.setattr(evaluate, "judge_batch", fake_batch)
+    result = evaluate.evaluate_readability(
+        [{"prompt": "p1"}, {"prompt": "p2"}],
+        [
+            "<think>t</think>\nhello\n```python\npass\n```",
+            "<think>t</think>\nworld\n```python\npass\n```",
+        ],
+        mock_judge=False,
+        model_tag="base",
+        judge_max_concurrent=4,
+    )
+    assert seen["n"] == 2
+    assert seen["conc"] == 4
+    assert result["overall"] == 8.0
 
 
 def test_pipeline_advance_state_skips_completed_phase():

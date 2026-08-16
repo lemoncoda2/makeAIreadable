@@ -7,7 +7,9 @@ Modes: full | hypothesis_check | benchmark | readability
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -15,7 +17,7 @@ from typing import Any, Optional
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from utils.api_judge import judge_collaboration, mock_judge_scores  # noqa: E402
+from utils.api_judge import judge_batch, mock_judge_scores  # noqa: E402
 from utils.code_executor import extract_code, separate_output  # noqa: E402
 from utils.metrics import (  # noqa: E402
     aggregate_readability_scores,
@@ -92,12 +94,49 @@ def dry_run_generation(task: dict[str, Any], model_tag: str) -> str:
     )
 
 
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _cuda_count() -> int:
+    try:
+        import torch
+
+        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _resolve_num_gpus(requested: Optional[int]) -> int:
+    available = _cuda_count()
+    if available <= 0:
+        return 1
+    if requested is None or int(requested) <= 0:
+        return available
+    return min(int(requested), available)
+
+
+def _release_runner(runner: Any) -> None:
+    del runner
+    try:
+        import gc
+
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class ModelRunner:
     def __init__(
         self,
         model_path: str,
         base_model_path: Optional[str] = None,
         thinking_budget_tokens: int = 256,
+        device: Optional[int] = 0,
     ):
         from utils.failfast import (
             assert_not_dry_run_placeholder,
@@ -132,7 +171,13 @@ class ModelRunner:
 
         self.tokenizer = load_tokenizer(tok_src)
         require_thinking_support(self.tokenizer, enable_thinking=True)
-        base = load_causal_lm(tok_src, torch_dtype="float16", device_map="auto")
+        # Put the full 4B on one GPU. device_map="auto" shards one sequence
+        # across cards and serializes decode; a V100-32G holds Qwen3-4B FP16.
+        if device is None or device == "auto":
+            device_map: Any = "auto"
+        else:
+            device_map = {"": int(device)}
+        base = load_causal_lm(tok_src, torch_dtype="float16", device_map=device_map)
         if adapter_cfg.exists():
             self.model = maybe_merge_or_load_peft(
                 base, model_path, is_trainable=False
@@ -163,21 +208,54 @@ class ModelRunner:
         max_new_tokens: int = 768,
         temperature: float = 0.2,
     ) -> str:
+        return self.generate_many(
+            [{"prompt": prompt, "test_cases": list(public_test_cases or [])}],
+            max_new_tokens=max_new_tokens,
+            batch_size=1,
+            temperature=temperature,
+        )[0]
+
+    def generate_many(
+        self,
+        tasks: list[dict[str, Any]],
+        *,
+        max_new_tokens: int = 768,
+        batch_size: int = 4,
+        temperature: float = 0.2,
+    ) -> list[str]:
         import torch
 
-        messages = build_coding_messages(prompt, public_test_cases)
-        text = self._apply(self.tokenizer, messages, enable_thinking=True)
-        inputs = self.tokenizer(text, return_tensors="pt")
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
-        with torch.no_grad():
-            out = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=temperature > 0,
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        texts = []
+        for task in tasks:
+            messages = build_coding_messages(
+                task["prompt"], (task.get("test_cases") or [])[:1]
             )
-        gen = out[0][inputs["input_ids"].shape[1] :]
-        return self.tokenizer.decode(gen, skip_special_tokens=False)
+            texts.append(self._apply(self.tokenizer, messages, enable_thinking=True))
+
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        outputs: list[str] = []
+        for start in range(0, len(texts), batch_size):
+            chunk = texts[start : start + batch_size]
+            inputs = self.tokenizer(chunk, return_tensors="pt", padding=True)
+            inputs = {k: v.to(self._device) for k, v in inputs.items()}
+            prompt_len = int(inputs["input_ids"].shape[1])
+            with torch.no_grad():
+                out = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=temperature > 0,
+                    pad_token_id=pad_id,
+                )
+            for row in out:
+                gen = row[prompt_len:]
+                outputs.append(self.tokenizer.decode(gen, skip_special_tokens=False))
+            _log(f"[gen] {min(start + batch_size, len(texts))}/{len(texts)}")
+        return outputs
 
 
 def _is_executable_assert(tc: Any) -> bool:
@@ -227,6 +305,7 @@ def evaluate_readability(
     *,
     mock_judge: bool,
     model_tag: str,
+    judge_max_concurrent: int = 5,
 ) -> dict[str, Any]:
     scores: list[dict[str, float]] = []
     collabs: list[str] = []
@@ -243,8 +322,19 @@ def evaluate_readability(
             rl_like = collab if model_tag == "rl" else "ok done."
             good, bad = mock_judge_scores(regen_like, rl_like)
             scores.append(good if model_tag != "rl" else bad)
-        else:
-            scores.append(judge_collaboration(task.get("prompt", ""), collab or "(empty)"))
+
+    if not mock_judge:
+        items = [
+            {
+                "task_prompt": task.get("prompt", ""),
+                "text": collab or "(empty)",
+            }
+            for task, collab in zip(tasks, collabs)
+        ]
+        judged = asyncio.run(
+            judge_batch(items, max_concurrent=judge_max_concurrent)
+        )
+        scores = [row["score"] for row in judged]
 
     detail = aggregate_readability_scores(scores)
     return {
@@ -253,6 +343,37 @@ def evaluate_readability(
         "think_leak_rate": mean(leaks),
         "n": float(len(tasks)),
     }
+
+
+def _split_contiguous(tasks: list[dict[str, Any]], parts: int) -> list[list[dict[str, Any]]]:
+    parts = max(1, min(parts, len(tasks)))
+    chunks: list[list[dict[str, Any]]] = []
+    start = 0
+    for i in range(parts):
+        extra = 1 if i < (len(tasks) % parts) else 0
+        size = len(tasks) // parts + extra
+        chunks.append(tasks[start : start + size])
+        start += size
+    return [c for c in chunks if c]
+
+
+def _generate_shard(payload: dict[str, Any]) -> list[str]:
+    """Spawn worker: pin one visible GPU, then batch-generate a task shard."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(payload["gpu"])
+    runner = ModelRunner(
+        payload["model_path"],
+        base_model_path=payload["base_model_path"],
+        thinking_budget_tokens=payload["thinking_budget_tokens"],
+        device=0,
+    )
+    try:
+        return runner.generate_many(
+            payload["tasks"],
+            max_new_tokens=payload["max_new_tokens"],
+            batch_size=payload["batch_size"],
+        )
+    finally:
+        _release_runner(runner)
 
 
 def generate_for_model(
@@ -264,6 +385,8 @@ def generate_for_model(
     dry_run: bool,
     max_new_tokens: int = 768,
     thinking_budget_tokens: int = 256,
+    gen_batch_size: int = 4,
+    num_gpus: Optional[int] = None,
 ) -> list[str]:
     if dry_run:
         return [dry_run_generation(t, model_tag) for t in tasks]
@@ -273,32 +396,69 @@ def generate_for_model(
             "Refusing to inject ground-truth dry_run_generation stubs outside --dry_run "
             "(that would fake pass@1 / readability)."
         )
+    if gen_batch_size < 1:
+        raise SystemExit(f"[error] --gen_batch_size must be >= 1, got {gen_batch_size}")
+    if not tasks:
+        return []
+
+    n_gpu = _resolve_num_gpus(num_gpus)
+    if n_gpu > 1 and len(tasks) > 1:
+        import multiprocessing as mp
+
+        chunks = _split_contiguous(tasks, n_gpu)
+        _log(
+            f"[gen] tag={model_tag} tasks={len(tasks)} gpus={len(chunks)} "
+            f"batch={gen_batch_size}"
+        )
+        payloads = [
+            {
+                "gpu": gpu,
+                "model_path": model_path,
+                "base_model_path": base_model_path,
+                "thinking_budget_tokens": thinking_budget_tokens,
+                "max_new_tokens": max_new_tokens,
+                "batch_size": gen_batch_size,
+                "tasks": chunk,
+            }
+            for gpu, chunk in enumerate(chunks)
+        ]
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(len(payloads)) as pool:
+            parts = pool.map(_generate_shard, payloads)
+        merged: list[str] = []
+        for part in parts:
+            merged.extend(part)
+        if len(merged) != len(tasks):
+            raise RuntimeError(
+                f"multi-GPU generate returned {len(merged)} rows for {len(tasks)} tasks"
+            )
+        return merged
+
     runner = ModelRunner(
         model_path,
         base_model_path=base_model_path,
         thinking_budget_tokens=thinking_budget_tokens,
+        device=0,
     )
     try:
-        return [
-            runner.generate(
-                t["prompt"],
-                (t.get("test_cases") or [])[:1],
-                max_new_tokens=max_new_tokens,
-            )
-            for t in tasks
-        ]
+        if len(tasks) == 1:
+            return [
+                runner.generate(
+                    tasks[0]["prompt"],
+                    (tasks[0].get("test_cases") or [])[:1],
+                    max_new_tokens=max_new_tokens,
+                )
+            ]
+        _log(
+            f"[gen] tag={model_tag} tasks={len(tasks)} gpus=1 batch={gen_batch_size}"
+        )
+        return runner.generate_many(
+            tasks,
+            max_new_tokens=max_new_tokens,
+            batch_size=gen_batch_size,
+        )
     finally:
-        # Free VRAM before loading the next model tag (base → rl → final).
-        del runner
-        try:
-            import torch
-            import gc
-
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:  # noqa: BLE001
-            pass
+        _release_runner(runner)
 
 
 def evaluate_model(
@@ -315,6 +475,9 @@ def evaluate_model(
     num_tasks_readability: int,
     max_new_tokens: int = 768,
     thinking_budget_tokens: int = 256,
+    gen_batch_size: int = 4,
+    num_gpus: Optional[int] = None,
+    judge_max_concurrent: int = 5,
 ) -> dict[str, Any]:
     bench_tasks = mbpp_tasks[:num_tasks_benchmark]
     read_tasks = mbpp_tasks[:num_tasks_readability]
@@ -323,21 +486,16 @@ def evaluate_model(
     result: dict[str, Any] = {}
     need_bench = mode in ("full", "hypothesis_check", "benchmark")
     need_read = mode in ("full", "hypothesis_check", "readability")
+    gen_kwargs = {
+        "dry_run": dry_run,
+        "max_new_tokens": max_new_tokens,
+        "thinking_budget_tokens": thinking_budget_tokens,
+        "gen_batch_size": gen_batch_size,
+        "num_gpus": num_gpus,
+    }
 
+    bench_outs: Optional[list[str]] = None
     if need_bench:
-        outs = generate_for_model(
-            model_tag,
-            model_path,
-            base_model_path,
-            bench_tasks,
-            dry_run=dry_run,
-            max_new_tokens=max_new_tokens,
-            thinking_budget_tokens=thinking_budget_tokens,
-        )
-        mbpp = evaluate_benchmark(bench_tasks, outs)
-        result["mbpp_plus_pass1"] = mbpp["pass_at_1"]
-        result["avg_code_length"] = mbpp["avg_code_length"]
-        result["syntax_error_rate"] = mbpp["syntax_error_rate"]
         if lcb_eval:
             from utils.lcb_executor import fraction_lcb_ready
 
@@ -349,15 +507,27 @@ def evaluate_model(
                     "(stores harness=lcb + stdin/call cases). "
                     "Do not use assert-only fixtures for LCB."
                 )
-            lcb_outs = generate_for_model(
-                model_tag,
-                model_path,
-                base_model_path,
-                lcb_eval,
-                dry_run=dry_run,
-                max_new_tokens=max_new_tokens,
-                thinking_budget_tokens=thinking_budget_tokens,
+        else:
+            lcb_frac = None
+        gen_tasks = list(bench_tasks) + list(lcb_eval)
+        all_outs = generate_for_model(
+            model_tag,
+            model_path,
+            base_model_path,
+            gen_tasks,
+            **gen_kwargs,
+        )
+        if len(all_outs) != len(gen_tasks):
+            raise RuntimeError(
+                f"generate_for_model returned {len(all_outs)} rows for {len(gen_tasks)} tasks"
             )
+        bench_outs = all_outs[: len(bench_tasks)]
+        mbpp = evaluate_benchmark(bench_tasks, bench_outs)
+        result["mbpp_plus_pass1"] = mbpp["pass_at_1"]
+        result["avg_code_length"] = mbpp["avg_code_length"]
+        result["syntax_error_rate"] = mbpp["syntax_error_rate"]
+        if lcb_eval:
+            lcb_outs = all_outs[len(bench_tasks) :]
             lcb = evaluate_benchmark(lcb_eval, lcb_outs)
             result["lcb_easy_pass1"] = lcb["pass_at_1"]
             result["lcb_ready_frac"] = lcb_frac
@@ -365,17 +535,31 @@ def evaluate_model(
             result["lcb_easy_pass1"] = None
 
     if need_read:
-        outs = generate_for_model(
-            model_tag,
-            model_path,
-            base_model_path,
-            read_tasks,
-            dry_run=dry_run,
-            max_new_tokens=max_new_tokens,
-            thinking_budget_tokens=thinking_budget_tokens,
+        read_is_bench_prefix = (
+            bench_outs is not None
+            and len(read_tasks) <= len(bench_tasks)
+            and read_tasks == bench_tasks[: len(read_tasks)]
         )
+        if read_is_bench_prefix:
+            _log(
+                f"[info] reusing first {len(read_tasks)} {model_tag} bench "
+                "completions for readability (same generation contract)"
+            )
+            outs = bench_outs[: len(read_tasks)]
+        else:
+            outs = generate_for_model(
+                model_tag,
+                model_path,
+                base_model_path,
+                read_tasks,
+                **gen_kwargs,
+            )
         read = evaluate_readability(
-            read_tasks, outs, mock_judge=mock_judge, model_tag=model_tag
+            read_tasks,
+            outs,
+            mock_judge=mock_judge,
+            model_tag=model_tag,
+            judge_max_concurrent=judge_max_concurrent,
         )
         result["readability_overall"] = read["overall"]
         result["readability_detail"] = {
@@ -408,6 +592,19 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--num_tasks_readability", type=int, default=50)
     parser.add_argument("--max_new_tokens", type=int, default=768)
     parser.add_argument("--thinking_budget_tokens", type=int, default=256)
+    parser.add_argument(
+        "--gen_batch_size",
+        type=int,
+        default=4,
+        help="HF generate batch size per GPU (left-padded)",
+    )
+    parser.add_argument(
+        "--num_gpus",
+        type=int,
+        default=0,
+        help="Data-parallel GPU workers; 0 = all visible devices",
+    )
+    parser.add_argument("--judge_max_concurrent", type=int, default=5)
     parser.add_argument("--judge_api", default="deepseek")
     parser.add_argument("--mock_judge", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
@@ -496,7 +693,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     models_out: dict[str, Any] = {}
     for tag in tags:
-        print(f"Evaluating model={tag} path={path_map.get(tag)}")
+        _log(f"Evaluating model={tag} path={path_map.get(tag)}")
         models_out[tag] = evaluate_model(
             tag,
             path_map.get(tag),
@@ -510,6 +707,9 @@ def main(argv: Optional[list[str]] = None) -> None:
             num_tasks_readability=args.num_tasks_readability,
             max_new_tokens=args.max_new_tokens,
             thinking_budget_tokens=args.thinking_budget_tokens,
+            gen_batch_size=args.gen_batch_size,
+            num_gpus=args.num_gpus,
+            judge_max_concurrent=args.judge_max_concurrent,
         )
 
     payload = summarize_eval_results(cycle=args.cycle, models=models_out)
@@ -540,7 +740,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
-    print(f"Wrote evaluation → {args.output}")
+    _log(f"Wrote evaluation → {args.output}")
 
 
 if __name__ == "__main__":
